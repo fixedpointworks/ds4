@@ -54,3 +54,9 @@ At every major change where one of the following could be affected, make sure to
 2. Test the SSD streaming path.
 3. Test the distributed inference if it could be affected, but ask the user before doing so.
 4. Check if CUDA could be broken after the change, and ask the user to give you access to the CUDA machine to actually test if everything is still fine.
+
+## Agent skills
+
+- Issue tracker: Issues and specifications are tracked in GitHub Issues for `fixedpointworks/ds4`. See `docs/agents/issue-tracker.md`.
+- Triage labels: Use the five default canonical triage labels. See `docs/agents/triage-labels.md`.
+- Domain docs: This repository uses a single-context domain documentation layout. See `docs/agents/domain.md`.
