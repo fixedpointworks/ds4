@@ -2,6 +2,10 @@
 
 本仓库的 issue 和 spec 存放在 `fixedpointworks/ds4` 的 GitHub Issues 中。所有操作均使用 `gh` CLI。
 
+## 写作语言
+
+GitHub issue 的标题、正文和评论使用中文；其中的命令、路径、标签字符串和机器读取标志保留英文原文。
+
 ## 约定
 
 - **创建 issue**：`gh issue create --title "..." --body "..."`。多行正文使用 heredoc。
