@@ -1,0 +1,3 @@
+# TCIM 复用 DS4 的 GGUF 与 SSD 权重路径
+
+`hq50` 的 M50 logical device 0 只暴露约 24 GB device memory，无法容纳目标 `ds4f-q2` raw GGUF，因此 TCIM 首发复用 DS4 的 GGUF loader 与 SSD orchestration，而不引入 packed、reordered 或 requantized 权重派生物。共享 `ds4.c` 负责 model open/mmap、GGUF 解析与校验、span 构造、readahead、cache budget、selected-expert 调度，以及启动时 token-only、layer-major prefill 按层切换、decode 使用 all-static span 的既有 static 生命周期；TCIM backend 在现有 `ds4_gpu_*` seam 后实现各 span 的 model-map/storage/H2D、cache/residency/binding 与 compute primitives，routed experts 使用跨 token/session 的有界 SSD expert cache。首发不要求 static 权重一次 H2D 后常驻，也不禁止既有生命周期中的 remap/restage，不承诺 device 零拷贝或新增 GGUF identity gate；首发范围与验收规范只由 [Issue #1](https://github.com/fixedpointworks/ds4/issues/1) 定义。
