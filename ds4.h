@@ -20,6 +20,7 @@ typedef enum {
     DS4_BACKEND_METAL,
     DS4_BACKEND_CUDA,
     DS4_BACKEND_CPU,
+    DS4_BACKEND_TCIM,
 } ds4_backend;
 
 typedef enum {

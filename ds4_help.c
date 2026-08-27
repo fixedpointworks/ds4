@@ -151,8 +151,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
 #else
-    opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");
-    opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");
+    opt(fp, c, "--metal | --cuda | --tcim | --cpu", "Select the backend explicitly.");
+    opt(fp, c, "--backend NAME", "Backend name: metal, cuda, tcim, or cpu.");
     opt(fp, c, "--gpu-vram N[,N,...]|auto", "CUDA VRAM budgets per device, in GiB, or auto-detect free VRAM.");
     opt(fp, c, "--gpu-devices N[,N,...]", "CUDA device indices used by multi-GPU placement.");
     if (tool != DS4_HELP_EVAL) {
@@ -167,7 +167,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
-    opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm: opt in to SSD-backed model streaming instead of full residency.");
+    opt(fp, c, "--ssd-streaming", "Metal/CUDA/ROCm/TCIM: opt in to SSD-backed model streaming instead of full residency.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: N is an exact dynamic expert count; NGB is a routed memory budget that also reserves two full prefill layers. Auto: 80% working set minus non-routed weights; GLM Metal caps lower.");
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");

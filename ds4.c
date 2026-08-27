@@ -393,7 +393,9 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
 static bool ds4_backend_uses_graph(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
+    return backend == DS4_BACKEND_METAL ||
+           backend == DS4_BACKEND_CUDA ||
+           backend == DS4_BACKEND_TCIM;
 }
 
 static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
@@ -405,6 +407,7 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
         return false;
 #endif
     }
+    if (backend == DS4_BACKEND_TCIM) return true;
     return false;
 }
 
@@ -415,6 +418,7 @@ static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
 #else
     (void)backend;
 #endif
+    if (backend == DS4_BACKEND_TCIM) return true;
     return false;
 }
 
@@ -49084,6 +49088,7 @@ const char *ds4_backend_name(ds4_backend backend) {
 #else
         return "cuda";
 #endif
+    case DS4_BACKEND_TCIM:  return "tcim";
     case DS4_BACKEND_CPU:   return "cpu";
     }
     return "unknown";
@@ -57240,6 +57245,30 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
+
+    /* Pure model inspection is backend-independent. Normal engine startup must
+     * reject an identity that cannot be served by the adapter linked into this
+     * build before any ds4_gpu_* call can initialize a different backend. */
+#if defined(DS4_TCIM_BUILD)
+    if (!opt->inspect_only &&
+        e->backend != DS4_BACKEND_TCIM &&
+        e->backend != DS4_BACKEND_CPU) {
+        fprintf(stderr,
+                "ds4: %s backend requested but this build is linked with TCIM\n",
+                ds4_backend_name(e->backend));
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+#else
+    if (!opt->inspect_only && e->backend == DS4_BACKEND_TCIM) {
+        fprintf(stderr,
+                "ds4: TCIM backend requested but this build is not linked with TCIM\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+#endif
     if (load_slice && load_layer_end == UINT32_MAX) {
         const uint32_t normal_layers = ds4_model_normal_layer_count();
         if (normal_layers == 0) {
@@ -57263,7 +57292,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
+        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm/--tcim\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
