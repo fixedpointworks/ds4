@@ -48,6 +48,17 @@ Use `make` for build validation. Use `make test` for unit/regression tests when 
 model and Metal are available. Use live server tests only when intentionally
 testing the API surface.
 
+### TCIM/XH2 remote testing
+
+- Use `ssh hq50` to access the target host. Run `hm_smi -a` there to inspect
+  the available XH2 devices.
+- Before building or testing, sync the local worktree to
+  `hq50:/home/sky/ds4/`, excluding `.git/` and files matched by `.gitignore`:
+
+  ```sh
+  rsync -az --exclude='.git/' --filter=':- .gitignore' ./ hq50:/home/sky/ds4/
+  ```
+
 At every major change where one of the following could be affected, make sure to:
 
 1. Test the normal Metal path and that speed is still at the level it was.
