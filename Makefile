@@ -21,16 +21,6 @@ DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
-HOUMO_SDK_PREFIX ?= /usr/local/houmo-sdk
-TCIM_HAL_INCLUDE_DIR ?= $(HOUMO_SDK_PREFIX)/hal/include
-TCIM_HAL_EXPORT_INCLUDE_DIR ?= $(HOUMO_SDK_PREFIX)/hal/export/include
-TCIM_HAL_LIB_DIR ?= $(HOUMO_SDK_PREFIX)/hal/lib
-TCIM_CPPFLAGS ?= -I. -I$(TCIM_HAL_INCLUDE_DIR) -I$(TCIM_HAL_EXPORT_INCLUDE_DIR)
-TCIM_HAL_LDLIBS := -L$(TCIM_HAL_LIB_DIR) -Wl,-rpath,$(TCIM_HAL_LIB_DIR) -lhal_xh2a
-TCIM_CFLAGS = $(CFLAGS) $(TCIM_CPPFLAGS) -DDS4_TCIM_BUILD
-TCIM_CORE_OBJS := ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_tcim.o ds4_layer_pack.o
-TCIM_OBJS := ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(TCIM_CORE_OBJS)
-
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
@@ -67,6 +57,12 @@ ROCM_ARCH ?= gfx1151
 ROCM_HOST_CFLAGS ?= -fPIC
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+HOUMO_SDK_PREFIX ?= /usr/local/houmo-sdk
+TCIM_HAL_LIB_DIR ?= $(HOUMO_SDK_PREFIX)/hal/lib
+TCIM_HAL_LDLIBS := -L$(TCIM_HAL_LIB_DIR) -Wl,-rpath,$(TCIM_HAL_LIB_DIR) -lhal_xh2a
+TCIM_CFLAGS = $(CFLAGS) -I. -I$(HOUMO_SDK_PREFIX)/hal/include -I$(HOUMO_SDK_PREFIX)/hal/export/include -DDS4_TCIM_BUILD
+TCIM_CORE_OBJS := ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_tcim.o ds4_layer_pack.o
+TCIM_OBJS := ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(TCIM_CORE_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
@@ -83,8 +79,6 @@ help:
 	@echo "DS4 build targets:"
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make tcim         Build TCIM-only ./ds4 with the XH2 HAL"
-	@echo "  make test-tcim    Build TCIM ./ds4 and run the Step 1 host smoke"
 	@echo "  make test         Build and run tests"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
@@ -201,6 +195,13 @@ strix-halo:
 
 rocm: strix-halo
 
+tcim:
+	$(MAKE) -B ds4 \
+		CORE_OBJS="$(TCIM_CORE_OBJS)" \
+		CFLAGS="$(TCIM_CFLAGS)" \
+		DS4_LINK="$(CC) $(TCIM_CFLAGS)" \
+		DS4_LINK_LIBS="$(LDLIBS) $(TCIM_HAL_LDLIBS)"
+
 # Core regression suite for ROCm-only hosts: the CUDA-specific binaries
 # (tests/test_sampling, the CUDA session/mixed-batch oracles) are not part
 # of this target; run them through `make test` / `make cuda-regression` on
@@ -220,6 +221,12 @@ test-rocm:
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
+
+test-tcim: tcim
+	DS4_TCIM_BIN=./ds4 \
+	DS4_TCIM_OBJECTS="$(TCIM_OBJS)" \
+	DS4_TCIM_LINK_ARGS="$(TCIM_CFLAGS) $(TCIM_OBJS) $(LDLIBS) $(TCIM_HAL_LDLIBS)" \
+	./tests/test_tcim.sh
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -258,24 +265,6 @@ tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
-
-# Match the ROCm target: keep canonical object names, but rebuild every host
-# translation unit with the TCIM-wide definition so no other backend's object
-# can enter this link. Override Linux's CUDA-oriented link variables with CC;
-# METAL_LDLIBS provides the equivalent override for the Darwin ds4 rule.
-tcim:
-	$(MAKE) -B ds4 \
-		CORE_OBJS="$(TCIM_CORE_OBJS)" \
-		CFLAGS="$(TCIM_CFLAGS)" \
-		DS4_LINK="$(CC) $(TCIM_CFLAGS)" \
-		DS4_LINK_LIBS="$(LDLIBS) $(TCIM_HAL_LDLIBS)" \
-		METAL_LDLIBS="$(LDLIBS) $(TCIM_HAL_LDLIBS)"
-
-ds4_tcim.o: ds4_tcim.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h tcim/ds4_tcim_support.def
-	$(CC) $(CFLAGS) -c -o $@ ds4_tcim.c
-
-test-tcim: tcim
-	DS4_TCIM_BIN=./ds4 DS4_TCIM_OBJECTS="$(TCIM_OBJS)" DS4_TCIM_LINK_ARGS="$(TCIM_CFLAGS) $(TCIM_OBJS) $(LDLIBS) $(TCIM_HAL_LDLIBS)" ./tests/test_tcim.sh
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
@@ -405,6 +394,9 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
+
+ds4_tcim.o: ds4_tcim.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h tcim/ds4_tcim_support.def
+	$(CC) $(CFLAGS) -c -o $@ ds4_tcim.c
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
