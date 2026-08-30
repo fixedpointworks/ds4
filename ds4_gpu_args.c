@@ -149,7 +149,7 @@ int parse_gpu_vram_arg(const char     *vram_arg,
 
     /* Case 3: --gpu-vram auto. */
     if (!strcmp(vram_arg, "auto")) {
-#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_TCIM_BUILD)
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
         int filter_buf[DS4_MAX_GPUS];
         const int *filter_ptr = NULL;
         if (dev_count > 0) {

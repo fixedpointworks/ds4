@@ -218,16 +218,19 @@ static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
 #ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
+#elif defined(DS4_TCIM_BUILD)
+    if (!strcmp(s, "tcim")) return DS4_BACKEND_CUDA;
 #else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
 #endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
-    if (!strcmp(s, "tcim")) return DS4_BACKEND_TCIM;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
 #ifdef DS4_ROCM_BUILD
-    fprintf(stderr, "ds4: valid backends are: metal, rocm, cpu, tcim\n");
+    fprintf(stderr, "ds4: valid backends are: metal, rocm, cpu\n");
+#elif defined(DS4_TCIM_BUILD)
+    fprintf(stderr, "ds4: valid backends are: tcim, cpu\n");
 #else
-    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu, tcim\n");
+    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
 #endif
     exit(2);
 }
@@ -237,8 +240,6 @@ static ds4_backend default_backend(void) {
     return DS4_BACKEND_CPU;
 #elif defined(__APPLE__)
     return DS4_BACKEND_METAL;
-#elif defined(DS4_TCIM_BUILD)
-    return DS4_BACKEND_TCIM;
 #else
     return DS4_BACKEND_CUDA;
 #endif
@@ -1937,14 +1938,15 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
-        } else if (!strcmp(arg, "--tcim")) {
-            c.engine.backend = DS4_BACKEND_TCIM;
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
 #ifdef DS4_ROCM_BUILD
         } else if (!strcmp(arg, "--rocm")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+#elif defined(DS4_TCIM_BUILD)
+        } else if (!strcmp(arg, "--tcim")) {
             c.engine.backend = DS4_BACKEND_CUDA;
 #else
         } else if (!strcmp(arg, "--cuda")) {
@@ -1989,10 +1991,25 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.first_token_test = true;
         } else if (!strcmp(arg, "--metal-graph-test")) {
             c.gen.metal_graph_test = true;
+#if defined(DS4_ROCM_BUILD) || defined(DS4_TCIM_BUILD)
+            c.engine.backend = DS4_BACKEND_CUDA;
+#else
+            c.engine.backend = DS4_BACKEND_METAL;
+#endif
         } else if (!strcmp(arg, "--metal-graph-full-test")) {
             c.gen.metal_graph_full_test = true;
+#if defined(DS4_ROCM_BUILD) || defined(DS4_TCIM_BUILD)
+            c.engine.backend = DS4_BACKEND_CUDA;
+#else
+            c.engine.backend = DS4_BACKEND_METAL;
+#endif
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
+#if defined(DS4_ROCM_BUILD) || defined(DS4_TCIM_BUILD)
+            c.engine.backend = DS4_BACKEND_CUDA;
+#else
+            c.engine.backend = DS4_BACKEND_METAL;
+#endif
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);
