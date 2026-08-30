@@ -153,7 +153,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
 #elif defined(DS4_TCIM_BUILD)
     opt(fp, c, "--tcim | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: tcim or cpu.");
-    opt(fp, c, "--gpu-vram N", "TCIM device-memory budget, in GiB.");
+    opt(fp, c, "--gpu-vram N|auto", "TCIM device-memory budget, in GiB, or auto-detect free memory.");
     opt(fp, c, "--gpu-devices 0", "TCIM currently supports logical device 0 only.");
 #else
     opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");

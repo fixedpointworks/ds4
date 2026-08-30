@@ -21,6 +21,16 @@ DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
+HOUMO_SDK_PREFIX ?= /usr/local/houmo-sdk
+TCIM_HAL_INCLUDE_DIR ?= $(HOUMO_SDK_PREFIX)/hal/include
+TCIM_HAL_EXPORT_INCLUDE_DIR ?= $(HOUMO_SDK_PREFIX)/hal/export/include
+TCIM_HAL_LIB_DIR ?= $(HOUMO_SDK_PREFIX)/hal/lib
+TCIM_CPPFLAGS ?= -I. -I$(TCIM_HAL_INCLUDE_DIR) -I$(TCIM_HAL_EXPORT_INCLUDE_DIR)
+TCIM_HAL_LDLIBS := -L$(TCIM_HAL_LIB_DIR) -Wl,-rpath,$(TCIM_HAL_LIB_DIR) -lhal_xh2a
+TCIM_CFLAGS = $(CFLAGS) $(TCIM_CPPFLAGS) -DDS4_TCIM_BUILD
+TCIM_CORE_OBJS := ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_tcim.o ds4_layer_pack.o
+TCIM_OBJS := ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(TCIM_CORE_OBJS)
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
@@ -62,7 +72,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-tcim test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm tcim
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -73,6 +83,8 @@ help:
 	@echo "DS4 build targets:"
 	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make tcim         Build TCIM-only ./ds4 with the XH2 HAL"
+	@echo "  make test-tcim    Build TCIM ./ds4 and run the Step 1 host smoke"
 	@echo "  make test         Build and run tests"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
@@ -156,6 +168,8 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make tcim                Build TCIM-only ./ds4 with the XH2 HAL"
+	@echo "  make test-tcim           Build TCIM ./ds4 and run the Step 1 host smoke"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -244,6 +258,24 @@ tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
+
+# Match the ROCm target: keep canonical object names, but rebuild every host
+# translation unit with the TCIM-wide definition so no other backend's object
+# can enter this link. Override Linux's CUDA-oriented link variables with CC;
+# METAL_LDLIBS provides the equivalent override for the Darwin ds4 rule.
+tcim:
+	$(MAKE) -B ds4 \
+		CORE_OBJS="$(TCIM_CORE_OBJS)" \
+		CFLAGS="$(TCIM_CFLAGS)" \
+		DS4_LINK="$(CC) $(TCIM_CFLAGS)" \
+		DS4_LINK_LIBS="$(LDLIBS) $(TCIM_HAL_LDLIBS)" \
+		METAL_LDLIBS="$(LDLIBS) $(TCIM_HAL_LDLIBS)"
+
+ds4_tcim.o: ds4_tcim.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h tcim/ds4_tcim_support.def
+	$(CC) $(CFLAGS) -c -o $@ ds4_tcim.c
+
+test-tcim: tcim
+	DS4_TCIM_BIN=./ds4 DS4_TCIM_OBJECTS="$(TCIM_OBJS)" DS4_TCIM_LINK_ARGS="$(TCIM_CFLAGS) $(TCIM_OBJS) $(LDLIBS) $(TCIM_HAL_LDLIBS)" ./tests/test_tcim.sh
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
