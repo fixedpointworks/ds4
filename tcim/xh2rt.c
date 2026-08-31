@@ -1,4 +1,5 @@
 #include "xh2rt.h"
+#include "xh2rt_status.h"
 
 #include <ipu_api.h>
 #include <memory_allocator.h>
@@ -14,6 +15,8 @@
 #define XH2RT_GROUP_MAX_KERNELS UINT32_C(255)
 #define XH2RT_GROUP_SPM_LIMIT UINT64_C(1048576)
 #define XH2RT_GROUP_SYNC_TIMEOUT_US UINT32_C(0)
+#define XH2RT_STATUS_ARENA_BYTES \
+    (XH2RT_GROUP_MAX_KERNELS * XH2RT_STATUS_RECORD_BYTES)
 
 #define XH2RT_CORE_COUNT UINT32_C(2)
 #define XH2RT_TILE_COUNT UINT32_C(4)
@@ -88,6 +91,11 @@ struct xh2rt_context {
     xh2rt_allocation *allocations;
     xh2rt_buffer_view *views;
     xh2rt_buffer_view *kernels[XH2RT_KERNEL_COUNT];
+    xh2rt_buffer_view *status_buffer;
+    /* One bounded arena per context; records cannot overlap across KLDs.
+     * Keep transfer staging alive with quarantined device memory on failure. */
+    uint8_t status_host[XH2RT_STATUS_ARENA_BYTES];
+    uint32_t status_dirty;
     xh2rt_group *group;
     int batch_active;
     int poisoned;
@@ -101,6 +109,8 @@ static void xh2rt_stamp_group(xh2rt_result *result,
 static void xh2rt_group_release_host(xh2rt_context *context,
                                      xh2rt_group *group);
 static int xh2rt_group_reserve_pins(xh2rt_group *group, size_t add);
+static xh2rt_result xh2rt_status_transfer(xh2rt_context *context,
+                                         uint32_t records, int readback);
 
 /*
  * Public view pointers are opaque numeric handles, not wrapper addresses.
@@ -138,6 +148,8 @@ static xh2rt_result xh2rt_make_result(enum xh2rt_status status,
     result.status = status;
     result.operation = operation;
     result.group_id = -1;
+    result.kernel_index = UINT32_MAX;
+    result.kernel_stripe = UINT32_MAX;
     return result;
 }
 
@@ -550,6 +562,15 @@ xh2rt_result xh2rt_context_open(uint32_t logical_device,
         if (!xh2rt_result_is_ok(result))
             goto fail;
     }
+    result = xh2rt_buffer_alloc(context, XH2RT_STATUS_ARENA_BYTES,
+                                 &context->status_buffer);
+    if (!xh2rt_result_is_ok(result))
+        goto fail;
+    result = xh2rt_status_transfer(context, XH2RT_GROUP_MAX_KERNELS, 0);
+    if (!xh2rt_result_is_ok(result)) {
+        result = xh2rt_poison(context, result);
+        goto fail;
+    }
     *out_context = context;
     return xh2rt_make_result(XH2RT_STATUS_OK, "context_open");
 
@@ -813,6 +834,44 @@ static void xh2rt_group_unpin(xh2rt_context *context,
     group->pin_count = 0;
 }
 
+/* Private transfers must not call the public transfer API, which drains a
+ * group first. Initialize once per group and read once after completion. */
+static xh2rt_result xh2rt_status_transfer(xh2rt_context *context,
+                                         uint32_t records, int readback)
+{
+    xh2rt_buffer_view *view;
+    uint64_t global;
+    uint64_t iomap;
+    size_t bytes = (size_t)records * XH2RT_STATUS_RECORD_BYTES;
+    uint64_t host = (uint64_t)(uintptr_t)context->status_host;
+    const char *operation = readback ? "kernel_status.read"
+                                    : "kernel_status.initialize";
+    xh2rt_result result = xh2rt_checked_range(
+        context, context->status_buffer, 0, bytes, operation,
+        &view, NULL, &global, &iomap);
+    int rc;
+    int saved_errno;
+
+    if (!xh2rt_result_is_ok(result))
+        return result;
+    if ((iomap & (sizeof(uint32_t) - 1)) != 0)
+        return xh2rt_make_result(XH2RT_STATUS_MISALIGNED, operation);
+    if (!readback)
+        memset(context->status_host, 0xff, bytes);
+    errno = 0;
+    rc = xh2a_memory_transfer_copy_buffer(
+        context->transfer, readback ? global : host,
+        readback ? host : global, bytes,
+        readback ? XH2A_MEMORY_TRANSFER_TYPE_DEVICE_TO_HOST
+                 : XH2A_MEMORY_TRANSFER_TYPE_HOST_TO_DEVICE);
+    saved_errno = errno;
+    if (rc != 0) {
+        view->allocation->quarantined = 1;
+        return xh2rt_hal_result(operation, rc, saved_errno);
+    }
+    return xh2rt_make_result(XH2RT_STATUS_OK, operation);
+}
+
 static xh2rt_result xh2rt_ensure_group(xh2rt_context *context,
                                        size_t pin_slots)
 {
@@ -829,6 +888,12 @@ static xh2rt_result xh2rt_ensure_group(xh2rt_context *context,
                                   "launch.group_resources"));
         }
         return xh2rt_make_result(XH2RT_STATUS_OK, "group_reuse");
+    }
+    if (context->status_dirty != 0) {
+        result = xh2rt_status_transfer(context, context->status_dirty, 0);
+        if (!xh2rt_result_is_ok(result))
+            return xh2rt_poison(context, result);
+        context->status_dirty = 0;
     }
     group = (xh2rt_group *)calloc(1, sizeof(*group));
     if (group == NULL)
@@ -916,6 +981,7 @@ static xh2rt_result xh2rt_drain_group(xh2rt_context *context,
     xh2rt_result cleanup = xh2rt_make_result(XH2RT_STATUS_OK,
                                              "group_cleanup");
     int have_cleanup = 0;
+    int poison = 0;
     uint32_t execution_result = 0;
     int rc;
     int saved_errno;
@@ -953,9 +1019,47 @@ static xh2rt_result xh2rt_drain_group(xh2rt_context *context,
         primary.operation = "xh2a_ipu_sync_group.result";
         primary.raw_rc = 0;
         primary.saved_errno = saved_errno;
-    } else if (!xh2rt_result_is_ok(info_result)) {
+        poison = 1;
+    } else if (group->kernel_count != 0) {
+        xh2rt_result status_result =
+            xh2rt_status_transfer(context, group->kernel_count, 1);
+        uint32_t kernel;
+
+        if (!xh2rt_result_is_ok(status_result)) {
+            primary.status = status_result.status;
+            primary.operation = status_result.operation;
+            primary.raw_rc = status_result.raw_rc;
+            primary.saved_errno = status_result.saved_errno;
+            poison = 1;
+        } else {
+            /* Scan submission order: a later successful KLD must never hide
+             * an earlier failure. Pending also catches missing device writes. */
+            for (kernel = 0; kernel < group->kernel_count && !poison; kernel++) {
+                uint32_t stripe;
+                const uint8_t *record = context->status_host +
+                    (size_t)kernel * XH2RT_STATUS_RECORD_BYTES;
+                for (stripe = 0; stripe < XH2RT_STATUS_STRIPES; stripe++) {
+                    const uint8_t *slot = record + stripe * sizeof(uint32_t);
+                    uint32_t status = (uint32_t)slot[0] |
+                        ((uint32_t)slot[1] << 8) | ((uint32_t)slot[2] << 16) |
+                        ((uint32_t)slot[3] << 24);
+                    if (status == 0)
+                        continue;
+                    primary.status = XH2RT_STATUS_EXECUTION_FAILURE;
+                    primary.operation = "kernel_status";
+                    primary.kernel_status = status;
+                    primary.kernel_index = kernel;
+                    primary.kernel_stripe = stripe;
+                    poison = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (xh2rt_result_is_ok(primary) && !xh2rt_result_is_ok(info_result)) {
         primary = info_result;
     }
+    context->status_dirty = group->kernel_count;
 
     errno = 0;
     destroy_rc = xh2a_ipu_destroy_group(context->ipu, group->id);
@@ -981,7 +1085,7 @@ static xh2rt_result xh2rt_drain_group(xh2rt_context *context,
         primary.raw_rc = cleanup.raw_rc;
         primary.saved_errno = cleanup.saved_errno;
     }
-    if (execution_result != 0 || destroy_rc != 0)
+    if (poison || destroy_rc != 0)
         return xh2rt_poison(context, primary);
     if (!xh2rt_result_is_ok(primary))
         return xh2rt_record(context, primary);
@@ -1003,7 +1107,9 @@ static xh2rt_result xh2rt_launch_native(
     uint64_t *arguments, size_t argument_count)
 {
     xh2rt_buffer_view *views[4];
-    uint8_t envelope[16 + 4 * 8] = {0};
+    xh2rt_buffer_view *status_view;
+    uint64_t status_iomap;
+    uint8_t envelope[16 + 5 * 8] = {0};
     uint32_t envelope_bytes = (uint32_t)(16 + argument_count * 8);
     uint64_t count = arguments[argument_count - 1];
     uint64_t bytes;
@@ -1043,9 +1149,14 @@ static xh2rt_result xh2rt_launch_native(
     }
     if (count == 0)
         return xh2rt_make_result(XH2RT_STATUS_OK, "launch");
-    xh2rt_put_le64(envelope + 8, argument_count);
-    for (index = 0; index < argument_count; index++)
-        xh2rt_put_le64(envelope + 16 + index * 8, arguments[index]);
+    result = xh2rt_checked_range(
+        context, context->status_buffer, 0, XH2RT_STATUS_ARENA_BYTES,
+        "launch.status", &status_view, NULL, NULL, &status_iomap);
+    if (!xh2rt_result_is_ok(result))
+        return result;
+    if ((status_iomap & (sizeof(uint32_t) - 1)) != 0)
+        return xh2rt_record(context,
+            xh2rt_make_result(XH2RT_STATUS_MISALIGNED, "launch.status"));
 
     one_shot = !context->batch_active;
     group = context->group;
@@ -1056,12 +1167,18 @@ static xh2rt_result xh2rt_launch_native(
         if (!xh2rt_result_is_ok(result))
             return result;
     }
-    result = xh2rt_ensure_group(context, buffer_count + 1);
+    result = xh2rt_ensure_group(context, buffer_count + 2);
     if (!xh2rt_result_is_ok(result))
         return result;
     group = context->group;
     for (index = 0; index <= buffer_count; index++)
         xh2rt_group_pin_one(group, views[index]->allocation);
+    xh2rt_group_pin_one(group, status_view->allocation);
+    arguments[buffer_count] = status_iomap +
+        (uint64_t)group->kernel_count * XH2RT_STATUS_RECORD_BYTES;
+    xh2rt_put_le64(envelope + 8, argument_count);
+    for (index = 0; index < argument_count; index++)
+        xh2rt_put_le64(envelope + 16 + index * 8, arguments[index]);
 
     memset(&launch, 0, sizeof(launch));
     launch.kernel_addr = views[0]->allocation->iomap + views[0]->offset;
@@ -1098,10 +1215,10 @@ xh2rt_result xh2rt_fill_f32(xh2rt_context *context,
                              uint32_t value_bits, uint64_t count)
 {
     xh2rt_buffer_view *buffers[] = {destination};
-    uint64_t arguments[] = {0, value_bits, count};
+    uint64_t arguments[] = {0, 0, value_bits, count};
 
     return xh2rt_launch_native(context, XH2RT_FILL_F32, buffers, 1,
-                                arguments, 3);
+                                arguments, 4);
 }
 
 xh2rt_result xh2rt_add_f32(xh2rt_context *context,
@@ -1111,10 +1228,10 @@ xh2rt_result xh2rt_add_f32(xh2rt_context *context,
                             uint64_t count)
 {
     xh2rt_buffer_view *buffers[] = {lhs, rhs, destination};
-    uint64_t arguments[] = {0, 0, 0, count};
+    uint64_t arguments[] = {0, 0, 0, 0, count};
 
     return xh2rt_launch_native(context, XH2RT_ADD_F32, buffers, 3,
-                                arguments, 4);
+                                arguments, 5);
 }
 
 xh2rt_result xh2rt_commands_begin(xh2rt_context *context)

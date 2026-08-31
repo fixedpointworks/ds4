@@ -1,0 +1,74 @@
+#ifndef XH2RT_KERNEL_STATUS_HDPLH
+#define XH2RT_KERNEL_STATUS_HDPLH
+
+#include "xh2rt_status.h"
+#include "device/target/DeviceActiveInfo.h"
+#include "device/BarrierUtils.h"
+#include "device/DeviceBuiltinIntrinsic.h"
+#include "device/DeviceContext.h"
+#include "device/DeviceInstrument.h"
+
+static __device__ inline bool xh2rt_kernel_status_address_ok(uint64_t addr) {
+    return addr != 0 && (addr & 3u) == 0 &&
+           addr <= UINT64_MAX - XH2RT_STATUS_RECORD_BYTES;
+}
+
+static __device__ inline void xh2rt_kernel_context(
+        device::Context &context,
+        const device::target::ActiveCoreInfo &active_info,
+        uint32_t num_inputs) {
+    context.deviceId = 0;
+    context.corePhyId = active_info.physicalCoreId[active_info.logicalCoreId];
+    context.coreId = active_info.logicalCoreId;
+    context.tileId = active_info.tileId;
+    context.hartId = device::target::getHartId();
+    context.setChipVersion();
+    context.compatVersion = 1;
+    context.hartLogicId = context.hartId % 16;
+    context.enabledRvvNumPerTile = 4;
+    context.enabledVpNumPerTile = 4;
+    context.numOfCores = 2;
+    context.numOfMpus = 0;
+    context.numOfMpuGroup = 0;
+    context.numOfInput = num_inputs;
+    context.stopAtPrimitiveOpIndex = UINT64_MAX;
+    context.activeInfo = (void *)&active_info;
+}
+
+/* Every hart, including errors and empty stripes, reaches this epilogue.
+ * SDK barriers align RVs but do not reduce their values. Use owned GM scratch
+ * rather than SDK-private SPM, and publish only after all four harts drain. */
+static __device__ inline void xh2rt_kernel_complete(
+        device::Context &context, uint64_t status_addr, uint32_t local_status) {
+    device::allRvWaitForEverythingDoneInThisCore(context);
+    if (local_status == XH2RT_KERNEL_OK && context.unsupportedOpNum != 0)
+        local_status = XH2RT_KERNEL_PRIMITIVE_FAILURE;
+
+    const uint32_t stripe = context.corePhyId * 4u + context.tileId;
+    const uint32_t lane = context.hartId & 3u;
+    const bool writable = xh2rt_kernel_status_address_ok(status_addr);
+    volatile uint32_t *record =
+        reinterpret_cast<volatile uint32_t *>(status_addr);
+    if (writable)
+        record[XH2RT_STATUS_STRIPES + stripe * 4u + lane] = local_status;
+    RISCV_FENCE_RW_RW;
+    device::barrierForRVsInThisTile(context);
+
+    if (writable && lane == 0) {
+        uint32_t merged = XH2RT_KERNEL_OK;
+        for (uint32_t i = 0; i < XH2RT_STATUS_HARTS_PER_STRIPE; ++i) {
+            const uint32_t status =
+                record[XH2RT_STATUS_STRIPES + stripe * 4u + i];
+            if (merged == XH2RT_KERNEL_OK) merged = status;
+        }
+        record[stripe] = merged;
+    }
+    RISCV_FENCE_RW_RW;
+
+    /* Core 0's queue interrupt completes the group; it must not race core 1's
+     * status/data stores. Invalid status addresses stay pending on the host. */
+    device::barrierForTilesInAllCores(context, true);
+    device::waitForEverythingDoneInThisCoreBeforeKernelExit(context);
+}
+
+#endif

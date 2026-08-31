@@ -39,7 +39,12 @@ typedef struct xh2rt_result {
     uint32_t group_kernel_count;
     uint32_t group_core_count;
     uint32_t group_core_mask;
+    /* HAL sync's output and the kernel's output BO are separate channels.
+     * Kernel index/stripe are UINT32_MAX when no kernel status was reported. */
     uint32_t execution_result;
+    uint32_t kernel_status;
+    uint32_t kernel_index;
+    uint32_t kernel_stripe;
 } xh2rt_result;
 
 int xh2rt_result_is_ok(xh2rt_result result);
@@ -61,7 +66,8 @@ xh2rt_result xh2rt_context_last_error(const xh2rt_context *context);
 /*
  * Commands are blocking groups, not asynchronous streams.  A typed launch
  * outside an explicit batch is a one-shot operation and is complete when it
- * returns.  flush drains the current group while keeping the batch active;
+ * returns, including checking every kernel's output status. flush drains the
+ * current group while keeping the batch active;
  * end and synchronize drain it and leave batching inactive.
  */
 xh2rt_result xh2rt_commands_begin(xh2rt_context *context);

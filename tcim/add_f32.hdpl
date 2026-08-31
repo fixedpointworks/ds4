@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 #include "device/CppInclude.h"
+#include "kernel_status.hdplh"
 
 static __device__ inline void xh2rt_add_f32_direct(
         uint64_t lhs_addr, uint64_t rhs_addr, uint64_t dst_addr,
@@ -21,20 +22,31 @@ static __device__ inline void xh2rt_add_f32_direct(
 __global__ extern "C" void add_f32(uint64_t lhs_addr,
                                  uint64_t rhs_addr,
                                  uint64_t dst_addr,
+                                 uint64_t status_addr,
                                  uint64_t count) {
-    if (count == 0) return;
-    /* Primitive TensorDesc shapes are uint32_t in the frozen toolchain. */
-    if (count > UINT32_MAX) return;
-
     const auto active_info = device::target::getActiveInfo();
     const uint32_t hart_id = device::target::getHartId();
     const uint32_t core_id = device::target::getPhysicalCoreId();
     const uint32_t tile_id = device::target::getTileId();
-    if (core_id >= 2 || tile_id >= 4) return;
+    device::Context context{};
+    xh2rt_kernel_context(context, active_info, 2);
 
+    uint32_t status = XH2RT_KERNEL_OK;
+    /* Primitive TensorDesc shapes are uint32_t in the frozen toolchain. */
+    if (!xh2rt_kernel_status_address_ok(status_addr) || count > UINT32_MAX ||
+        (count != 0 &&
+         (lhs_addr == 0 || rhs_addr == 0 || dst_addr == 0 ||
+          (lhs_addr & 3u) != 0 || (rhs_addr & 3u) != 0 ||
+          (dst_addr & 3u) != 0 ||
+          lhs_addr > UINT64_MAX - count * sizeof(fp32_t) ||
+          rhs_addr > UINT64_MAX - count * sizeof(fp32_t) ||
+          dst_addr > UINT64_MAX - count * sizeof(fp32_t))))
+        status = XH2RT_KERNEL_INVALID_ARGUMENT;
+
+    const uint64_t work_count = status == XH2RT_KERNEL_OK ? count : 0;
     const uint64_t stripe = (uint64_t)core_id * 4 + tile_id;
-    const uint64_t quotient = count / 8;
-    const uint64_t remainder = count % 8;
+    const uint64_t quotient = work_count / 8;
+    const uint64_t remainder = work_count % 8;
     const uint64_t start =
         quotient * stripe + (stripe < remainder ? stripe : remainder);
     const uint64_t stripe_count = quotient + (stripe < remainder ? 1 : 0);
@@ -43,35 +55,9 @@ __global__ extern "C" void add_f32(uint64_t lhs_addr,
     const uint64_t lhs_base = lhs_addr;
     const uint64_t rhs_base = rhs_addr;
     const uint64_t dst_base = dst_addr;
-    const uint64_t total_bytes = count * sizeof(fp32_t);
-    if (lhs_base == 0 || rhs_base == 0 || dst_base == 0 ||
-        (lhs_base & 3u) != 0 || (rhs_base & 3u) != 0 ||
-        (dst_base & 3u) != 0 ||
-        lhs_base > UINT64_MAX - total_bytes ||
-        rhs_base > UINT64_MAX - total_bytes ||
-        dst_base > UINT64_MAX - total_bytes)
-        return;
     lhs_addr += byte_offset;
     rhs_addr += byte_offset;
     dst_addr += byte_offset;
-
-    device::Context context{};
-    context.deviceId = 0;
-    context.corePhyId = active_info.physicalCoreId[active_info.logicalCoreId];
-    context.coreId = active_info.logicalCoreId;
-    context.tileId = active_info.tileId;
-    context.hartId = (uint8_t)hart_id;
-    context.setChipVersion();
-    context.compatVersion = 1;
-    context.hartLogicId = (uint8_t)(hart_id % 16);
-    context.enabledRvvNumPerTile = 4;
-    context.enabledVpNumPerTile = 4;
-    context.numOfCores = 2;
-    context.numOfMpus = 0;
-    context.numOfMpuGroup = 0;
-    context.numOfInput = 2;
-    context.stopAtPrimitiveOpIndex = UINT64_MAX;
-    context.activeInfo = (void *)&active_info;
 
     const uint64_t lane = hart_id & 3u;
     const bool lane_active = lane < stripe_count;
@@ -115,20 +101,18 @@ __global__ extern "C" void add_f32(uint64_t lhs_addr,
     /* The Primitive contains a four-RV barrier: all 32 harts must have work
        before any enters it. Use a launch-wide direct path for smaller vectors
        and exact aliases, whose in-place ordering the Primitive does not promise. */
-    if (count < 32 || dst_base == lhs_base || dst_base == rhs_base) {
-        xh2rt_add_f32_direct(lhs_addr, rhs_addr, dst_addr, stripe_count,
-                             hart_id);
-    } else {
-        /* HmintAddGm does not partition a one-dimensional TensorDesc by hart;
-           each active hart owns one interleaved lane of its tile stripe. */
-        primitive_hmint_add_gm(context, config, tensors, false, false);
+    if (work_count != 0) {
+        if (count < 32 || dst_base == lhs_base || dst_base == rhs_base) {
+            xh2rt_add_f32_direct(lhs_addr, rhs_addr, dst_addr, stripe_count,
+                                 hart_id);
+        } else {
+            /* HmintAddGm does not partition a one-dimensional TensorDesc by
+               hart; each owns one interleaved lane of its tile stripe. */
+            primitive_hmint_add_gm(context, config, tensors, false, false);
+        }
     }
 
-    /* Inactive harts and empty stripes must reach the same common epilogue.
-       Rendezvous both cores before the final per-core drain so core 0's group
-       interrupt cannot race core 1's final GM stores. */
-    device::barrierForTilesInAllCores(context, true);
-    device::waitForEverythingDoneInThisCoreBeforeKernelExit(context);
+    xh2rt_kernel_complete(context, status_addr, status);
 }
 
 int main(void) {
