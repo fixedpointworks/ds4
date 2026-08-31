@@ -114,9 +114,10 @@ xh2rt_result xh2rt_buffer_validate_iomap(
 /*
  * These wrappers launch the built-in fill_f32.hdpl and add_f32.hdpl kernels,
  * using the SDK's native uint64_t arguments and 2-core x 4-tile execution.
- * The caller owns buffer extents and alignment; no operator argument validation
- * is performed. value_bits is the float's unchanged uint32_t representation,
- * widened to a uint64_t device argument.
+ * Nonempty launches require count * 4 bytes in each view and 4-byte aligned
+ * addresses. add accepts at most UINT32_MAX elements. A zero count validates
+ * the handles but does not submit or drain work. value_bits is the float's
+ * unchanged uint32_t representation, widened to a uint64_t device argument.
  */
 xh2rt_result xh2rt_fill_f32(xh2rt_context *context,
                              xh2rt_buffer_view *destination,

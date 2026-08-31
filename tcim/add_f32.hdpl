@@ -112,12 +112,13 @@ __global__ extern "C" void add_f32(uint64_t lhs_addr,
                            device::AddrMode::UNIVERSAL},
     };
 
-    /* The Primitive does not publish an in-place ordering guarantee.  Keep
-       exact source/destination aliasing correct for the stateful counter gate. */
-    if (dst_base == lhs_base || dst_base == rhs_base) {
+    /* The Primitive contains a four-RV barrier: all 32 harts must have work
+       before any enters it. Use a launch-wide direct path for smaller vectors
+       and exact aliases, whose in-place ordering the Primitive does not promise. */
+    if (count < 32 || dst_base == lhs_base || dst_base == rhs_base) {
         xh2rt_add_f32_direct(lhs_addr, rhs_addr, dst_addr, stripe_count,
                              hart_id);
-    } else if (lane_active) {
+    } else {
         /* HmintAddGm does not partition a one-dimensional TensorDesc by hart;
            each active hart owns one interleaved lane of its tile stripe. */
         primitive_hmint_add_gm(context, config, tensors, false, false);

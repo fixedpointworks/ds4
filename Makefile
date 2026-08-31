@@ -474,7 +474,7 @@ ds4_tcim.o: ds4_tcim.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 
 # Entry names match filenames so parallel HDPL links don't share a debug ELF.
 # Only hex is retained; raw code must fit the hardware's 16-bit length field.
-tcim/%.hex: tcim/%.hdpl
+tcim/%.hex: tcim/%.hdpl Makefile
 	HDPL_PATH="$(HOUMO_PREFIX)" HDPLCC_PATH="$(HOUMO_PREFIX)" TMPDIR="$(abspath $(@D))" HM_PLATFORM=2 $(HOUMO_PREFIX)/bin/hdplc++ $(TCIM_HDPLFLAGS) -x hdpl $< -o $(@:.hex=.o) $(TCIM_HDPL_LDLIBS)
 	$(HOUMO_PREFIX)/bin/llvm-objcopy $(@:.hex=.o) --dump-section=.hdpl_fatbin=$(@:.hex=.elf)
 	$(HOUMO_PREFIX)/bin/llvm-objcopy $(@:.hex=.elf) --dump-section=$*=$(@:.hex=.bin)
@@ -483,7 +483,8 @@ tcim/%.hex: tcim/%.hdpl
 		echo "$*: payload size $$payload_bytes is outside 1..65535" >&2; \
 		exit 1; \
 	fi
-	xxd -i < $(@:.hex=.bin) > $@
+	xxd -i -n xh2rt_$*_code $(@:.hex=.bin) > $@
+	sed -i 's/^unsigned /static const unsigned /' $@
 	rm -f $(@:.hex=.o) $(@:.hex=.elf) $(@:.hex=.bin) $(@:.hex=.debug.elf) $(@D)/kernel_entry.hbin
 
 tcim/xh2rt.o: tcim/xh2rt.c tcim/xh2rt.h $(TCIM_HEX)

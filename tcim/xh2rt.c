@@ -18,12 +18,9 @@
 #define XH2RT_CORE_COUNT UINT32_C(2)
 #define XH2RT_TILE_COUNT UINT32_C(4)
 
-static const uint8_t xh2rt_fill_f32_code[] = {
+/* Complete declarations make empty/truncated xxd output fail host compilation. */
 #include "fill_f32.hex"
-};
-static const uint8_t xh2rt_add_f32_code[] = {
 #include "add_f32.hex"
-};
 
 enum xh2rt_kernel {
     XH2RT_FILL_F32,
@@ -214,6 +211,30 @@ static xh2rt_buffer_view *xh2rt_find_view(
             return view;
     }
     return NULL;
+}
+
+/* Handles are never reused, so stale detection does not need tombstones.
+ * Retain only records that still own a reference, an inflight BO or a retry. */
+static void xh2rt_forget_view(xh2rt_context *context,
+                              xh2rt_buffer_view *view)
+{
+    xh2rt_buffer_view **link = &context->views;
+
+    while (*link != view)
+        link = &(*link)->next;
+    *link = view->next;
+    free(view);
+}
+
+static void xh2rt_forget_allocation(xh2rt_context *context,
+                                    xh2rt_allocation *allocation)
+{
+    xh2rt_allocation **link = &context->allocations;
+
+    while (*link != allocation)
+        link = &(*link)->next;
+    *link = allocation->next;
+    free(allocation);
 }
 
 static xh2rt_result xh2rt_require_open(xh2rt_context *context,
@@ -708,7 +729,7 @@ static xh2rt_result xh2rt_free_allocation(xh2rt_context *context,
             context,
             xh2rt_hal_result("xh2a_memory_allocator_free_buffer_object",
                               rc, saved_errno));
-    allocation->bo_live = 0;
+    xh2rt_forget_allocation(context, allocation);
     return xh2rt_make_result(XH2RT_STATUS_OK, operation);
 }
 
@@ -972,9 +993,9 @@ static xh2rt_result xh2rt_drain_group(xh2rt_context *context,
  * arguments. Keep device entry arguments uniformly 64-bit; float values travel
  * as integer bits. This is the verified SDK subset, not a general C ABI packer.
  *
- * The typed wrappers put all buffer arguments first. Resolve their IOMAPs and
- * pin the backing BOs (including code), but leave sizes, alignment and operator
- * semantics to the caller. Each wrapper selects its built-in kernel.
+ * The typed wrappers put all buffer arguments first and the element count
+ * last. Check every extent and address before creating or draining a group,
+ * then pin the backing BOs (including code).
  */
 static xh2rt_result xh2rt_launch_native(
     xh2rt_context *context, enum xh2rt_kernel kernel,
@@ -984,6 +1005,8 @@ static xh2rt_result xh2rt_launch_native(
     xh2rt_buffer_view *views[4];
     uint8_t envelope[16 + 4 * 8] = {0};
     uint32_t envelope_bytes = (uint32_t)(16 + argument_count * 8);
+    uint64_t count = arguments[argument_count - 1];
+    uint64_t bytes;
     size_t index;
     xh2rt_group *group;
     struct kernel_launch_data launch;
@@ -994,18 +1017,32 @@ static xh2rt_result xh2rt_launch_native(
 
     if (!xh2rt_result_is_ok(result))
         return result;
+    if (count > UINT64_MAX / sizeof(uint32_t))
+        return xh2rt_record(
+            context, xh2rt_make_result(XH2RT_STATUS_OVERFLOW,
+                                        "launch.count"));
+    if (kernel == XH2RT_ADD_F32 && count > UINT32_MAX)
+        return xh2rt_record(
+            context, xh2rt_make_result(XH2RT_STATUS_OUT_OF_RANGE,
+                                        "launch.count"));
+    bytes = count * sizeof(uint32_t);
     result = xh2rt_require_view(context, context->kernels[kernel],
                                  "launch.kernel", &views[0]);
     if (!xh2rt_result_is_ok(result))
         return result;
     for (index = 0; index < buffer_count; index++) {
-        result = xh2rt_require_view(context, buffers[index],
-                                     "launch.buffer", &views[index + 1]);
+        result = xh2rt_checked_range(
+            context, buffers[index], 0, bytes, "launch.buffer",
+            &views[index + 1], NULL, NULL, &arguments[index]);
         if (!xh2rt_result_is_ok(result))
             return result;
-        arguments[index] = views[index + 1]->allocation->iomap +
-                           views[index + 1]->offset;
+        if (count != 0 && (arguments[index] & (sizeof(uint32_t) - 1)) != 0)
+            return xh2rt_record(
+                context, xh2rt_make_result(XH2RT_STATUS_MISALIGNED,
+                                            "launch.buffer"));
     }
+    if (count == 0)
+        return xh2rt_make_result(XH2RT_STATUS_OK, "launch");
     xh2rt_put_le64(envelope + 8, argument_count);
     for (index = 0; index < argument_count; index++)
         xh2rt_put_le64(envelope + 16 + index * 8, arguments[index]);
@@ -1196,16 +1233,17 @@ xh2rt_result xh2rt_buffer_alloc(xh2rt_context *context, uint64_t bytes,
     result = xh2rt_validate_bo(context, &allocation->bo, bytes,
                                &allocation->iomap);
     if (!xh2rt_result_is_ok(result)) {
-        allocation->next = context->allocations;
-        context->allocations = allocation;
         errno = 0;
         rc = xh2a_memory_allocator_free_buffer_object(&allocation->bo);
         saved_errno = errno;
         (void)saved_errno; /* Snapshot before retaining the primary error. */
-        if (rc == 0)
-            allocation->bo_live = 0;
-        else
+        if (rc == 0) {
+            free(allocation);
+        } else {
+            allocation->next = context->allocations;
+            context->allocations = allocation;
             context->state = XH2RT_CONTEXT_CLOSING;
+        }
         free(view);
         return xh2rt_record(context, result);
     }
@@ -1249,8 +1287,6 @@ xh2rt_result xh2rt_buffer_release(xh2rt_context *context,
     xh2rt_allocation *allocation;
     xh2rt_buffer_view *view = NULL;
     xh2rt_result result;
-    int rc;
-    int saved_errno;
 
     if (buffer_pointer == NULL)
         return xh2rt_record(
@@ -1263,57 +1299,32 @@ xh2rt_result xh2rt_buffer_release(xh2rt_context *context,
     if (!xh2rt_result_is_ok(result))
         return result;
     view = xh2rt_find_view(context, *buffer_pointer);
-    if (view != NULL && view->release_pending) {
-        if (view->allocation->quarantined ||
-            view->allocation->inflight != 0) {
-            *buffer_pointer = NULL;
-            return xh2rt_make_result(XH2RT_STATUS_OK,
-                                     "buffer_release.deferred");
-        }
-        errno = 0;
-        rc = xh2a_memory_allocator_free_buffer_object(&view->allocation->bo);
-        saved_errno = errno;
-        if (rc != 0)
-            return xh2rt_record(
-                context,
-                xh2rt_hal_result("xh2a_memory_allocator_free_buffer_object",
-                                  rc, saved_errno));
-        view->allocation->bo_live = 0;
-        view->release_pending = 0;
-        *buffer_pointer = NULL;
-        return result;
+    if (view == NULL || !view->release_pending) {
+        result = xh2rt_require_view(context, *buffer_pointer,
+                                    "buffer_release", &view);
+        if (!xh2rt_result_is_ok(result))
+            return result;
+        view->references--;
+        view->allocation->logical_references--;
+        if (view->references == 0)
+            view->active = 0;
     }
-    result = xh2rt_require_view(context, *buffer_pointer, "buffer_release",
-                                &view);
-    if (!xh2rt_result_is_ok(result))
-        return result;
-
     allocation = view->allocation;
-    view->references--;
-    allocation->logical_references--;
+    if (allocation->logical_references == 0) {
+        if (allocation->inflight != 0 || allocation->quarantined) {
+            result = xh2rt_make_result(XH2RT_STATUS_OK,
+                                        "buffer_release.deferred");
+        } else {
+            result = xh2rt_free_allocation(context, allocation,
+                                            "buffer_release");
+            if (!xh2rt_result_is_ok(result)) {
+                view->release_pending = 1;
+                return result;
+            }
+        }
+    }
     if (view->references == 0)
-        view->active = 0;
-
-    if (allocation->logical_references != 0 || !allocation->bo_live) {
-        *buffer_pointer = NULL;
-        return result;
-    }
-    if (allocation->inflight != 0 || allocation->quarantined) {
-        *buffer_pointer = NULL;
-        return xh2rt_make_result(XH2RT_STATUS_OK,
-                                 "buffer_release.deferred");
-    }
-    errno = 0;
-    rc = xh2a_memory_allocator_free_buffer_object(&allocation->bo);
-    saved_errno = errno;
-    if (rc != 0) {
-        view->release_pending = 1;
-        return xh2rt_record(
-            context,
-            xh2rt_hal_result("xh2a_memory_allocator_free_buffer_object",
-                              rc, saved_errno));
-    }
-    allocation->bo_live = 0;
+        xh2rt_forget_view(context, view);
     *buffer_pointer = NULL;
     return result;
 }
