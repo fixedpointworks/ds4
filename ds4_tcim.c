@@ -157,7 +157,7 @@ int ds4_gpu_args_probe_auto_cuda(const int      *device_filter,
 #define DS4_TCIM_UNAVAILABLE(signature, failure) \
     signature { errno = ENOTSUP; return (failure); }
 
-/* REQUIRED: 162 entries. */
+/* REQUIRED: 173 entries. */
 DS4_TCIM_REQUIRED(int ds4_gpu_add3_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_add_rms_norm_weight_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, float), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_add_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t), 0)
@@ -203,6 +203,16 @@ DS4_TCIM_REQUIRED(int ds4_gpu_embed_tokens_quant_tensor(ds4_gpu_tensor *, const 
 DS4_TCIM_REQUIRED(int ds4_gpu_end_commands(void), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_flush_commands(void), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_flush_encoder(void), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_embedding_bf16(ds4_gpu_tensor *, const void *, uint64_t, uint64_t, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_expand_pool_selection_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_indexer_pool_update_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, _Bool), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_indexer_scores_batch_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, _Bool), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_kda_decode(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, float, float), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_kda_prefill(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, float, float), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_matmul_bf16(ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, const ds4_gpu_tensor *, uint32_t), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_scatter_image_hc(ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm53_vision_encode(float *, const float *, uint32_t, uint32_t, const void *, uint64_t, const ds4_glm53_vision_weights *), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, _Bool, uint32_t, uint32_t, uint32_t), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_attention_flash_staged_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, _Bool), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_attention_flash_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, _Bool), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_attention_full_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, _Bool), 0)
@@ -224,8 +234,8 @@ DS4_TCIM_REQUIRED(int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(ds4_gpu_tensor *
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_qk_lowrank_typed_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, _Bool, float), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_rope_tail_tensor(ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float, float, float, float, float), 0)
-DS4_TCIM_REQUIRED(int ds4_gpu_glm_routed_moe_batch_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, uint32_t, uint32_t, _Bool), 0)
-DS4_TCIM_REQUIRED(int ds4_gpu_glm_routed_moe_one_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, _Bool), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm_routed_moe_batch_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, float, uint32_t, const ds4_gpu_tensor *, uint32_t, uint32_t, _Bool), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_glm_routed_moe_one_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, float, uint32_t, const ds4_gpu_tensor *, _Bool), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_router_select_batch_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, const ds4_gpu_tensor *, uint32_t, uint32_t, float, uint32_t), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_router_select_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, const ds4_gpu_tensor *, uint32_t, uint32_t, float), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_glm_store_compact_kv_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, _Bool), 0)
@@ -288,6 +298,7 @@ DS4_TCIM_REQUIRED(int ds4_gpu_routed_moe_owned_slots_combine_tensor(ds4_gpu_tens
 DS4_TCIM_REQUIRED(int ds4_gpu_routed_moe_set_selected_override(const int32_t *, uint32_t), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, _Bool, _Bool, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, float, uint32_t), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_router_select_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, uint32_t, _Bool, _Bool, const ds4_gpu_tensor *), 0)
+DS4_TCIM_REQUIRED(int ds4_gpu_set_aux_model_map_range(const void *, uint64_t, uint64_t, uint64_t), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_set_current_device(int), 1)
 DS4_TCIM_REQUIRED(int ds4_gpu_set_current_device_fenced(int), 1)
 DS4_TCIM_REQUIRED(int ds4_gpu_set_model_fd(int), 0)
@@ -321,7 +332,7 @@ DS4_TCIM_REQUIRED(int ds4_gpu_tensor_write(ds4_gpu_tensor *, uint64_t, const voi
 DS4_TCIM_REQUIRED(uint64_t ds4_gpu_tier_free_vram(int), 0)
 DS4_TCIM_REQUIRED(int ds4_gpu_wait_selected_readback_ready(uint64_t, const char *), 0)
 
-/* OPTIONAL_FALLBACK: 40 entries. */
+/* OPTIONAL_FALLBACK: 42 entries. */
 DS4_TCIM_OPTIONAL(int ds4_gpu_build_derived_artifacts(const void *, uint64_t, const char *), 0)
 DS4_TCIM_OPTIONAL(int ds4_gpu_commands_active(void), 0)
 DS4_TCIM_OPTIONAL_VOID(void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *))
@@ -332,10 +343,13 @@ DS4_TCIM_OPTIONAL(int ds4_gpu_decode_graphs_supported(void), 0)
 DS4_TCIM_OPTIONAL(int ds4_gpu_dsv4_comp_row_finalize_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, uint32_t, uint64_t, ds4_gpu_tensor *, uint32_t, uint64_t, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint32_t, uint32_t, uint32_t, float, float, float, float, float, float, float), 0)
 DS4_TCIM_OPTIONAL(int ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, ds4_gpu_tensor *, const ds4_gpu_tensor *, uint64_t, uint32_t, ds4_gpu_tensor *, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float, float, float, float, float, float), 0)
 DS4_TCIM_OPTIONAL_VOID(void ds4_gpu_enable_q8_dequant_gemm(void))
+/* Returning 0 from paired projections selects separate required matmuls. */
+DS4_TCIM_OPTIONAL(int ds4_gpu_glm53_matmul_bf16_qkv(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, const ds4_gpu_tensor *), 0)
 DS4_TCIM_OPTIONAL(int ds4_gpu_hc_rms_norm_mix_f16_available(void), 0)
 DS4_TCIM_OPTIONAL(int ds4_gpu_hc_rms_norm_mix_f16_tensor(ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, uint32_t, float), 0)
 DS4_TCIM_OPTIONAL(int ds4_gpu_matmul_f16_pair_compressor_store_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint64_t, uint32_t, const ds4_gpu_tensor *, uint32_t, uint32_t), 0)
 DS4_TCIM_OPTIONAL(int ds4_gpu_matmul_f16_quad_compressor_store_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint64_t, uint32_t, uint64_t, uint32_t, uint32_t, const ds4_gpu_tensor *, uint32_t, uint32_t), 0)
+DS4_TCIM_OPTIONAL(int ds4_gpu_matmul_q4_K_pair_decode_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_gpu_tensor *), 0)
 DS4_TCIM_OPTIONAL(int ds4_gpu_model_range_replaced(const void *, uint64_t, uint64_t), 0)
 DS4_TCIM_OPTIONAL_VOID(void ds4_gpu_model_residency_skip(int))
 DS4_TCIM_OPTIONAL(int ds4_gpu_preload_q4_expert_tables(const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t), 0)
@@ -378,7 +392,7 @@ DS4_TCIM_UNAVAILABLE(int ds4_gpu_attention_output_q8_tp_tensor(ds4_gpu_tensor *,
 DS4_TCIM_UNAVAILABLE(int ds4_gpu_device_cache_support_tensors(int, int, const ds4_tensor_range *, int, int), 1)
 DS4_TCIM_UNAVAILABLE(int ds4_gpu_device_cache_tensors(int, const ds4_tensor_range *, int), 1)
 DS4_TCIM_UNAVAILABLE(int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint32_t, const ds4_gpu_tensor *, uint32_t, _Bool, uint32_t, _Bool, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float, float, float, float, float), 0)
-DS4_TCIM_UNAVAILABLE(int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, uint32_t, uint32_t), 0)
+DS4_TCIM_UNAVAILABLE(int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t, float, uint32_t, const ds4_gpu_tensor *, uint32_t, uint32_t), 0)
 DS4_TCIM_UNAVAILABLE(int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(const ds4_gpu_stream_expert_table *, const ds4_gpu_tensor *, uint32_t), 0)
 DS4_TCIM_UNAVAILABLE(int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t), 0)
 DS4_TCIM_UNAVAILABLE(int ds4_gpu_matmul_q8_0_kslice_rows_tensor(ds4_gpu_tensor *, const void *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, const ds4_gpu_tensor *, uint64_t), 0)
