@@ -1,43 +1,20 @@
 # XH2 纯 C 算子 runtime 可行性
 
-日期：2026-08-29
+更新：2026-08-31
 
 ## 结论
 
-**Go：按 CUDA 式分层实现 TCIM/XH2 算子后端。** hq50 小 kernel prototype 已证明纯 C + `libhal_xh2a` 能装载 raw payload、提交 KLD，并按正确地址域读写 DDR。它证明的是执行底座可行，不代表 DS4 算子覆盖、数值和性能已经完成。
+**Go：纯 C + `libhal_xh2a` 可作为 TCIM/XH2 算子后端的执行底座。** hq50 已验证原生参数 ABI、内嵌 kernel、DDR 读写、BO 生命周期和批量执行；这不代表 DS4 算子覆盖、数值和性能已经完成。
 
-- 删除 `DS4_BACKEND_TCIM`；TCIM 独立构建与 ROCm 一样复用 `DS4_BACKEND_CUDA` identity 和 `ds4_gpu_*` 契约。
-- 复用的不是 CUDA runtime、kernel 或 capability；TCIM 只链接自己的 C adapter/runtime。
-- `.xh2k` 类似 `cubin`：一个算子/variant 的 payload 加最小 ABI/KLD metadata，不是 HMM，也不是模型容器。
-- weights、KV、inputs、outputs、workspace、GGUF/SSD cache 均由 DS4 宿主代码管理。
-- 官方 Dots TCIM 路径只保留为 ABI/数值 oracle；entry-only relink 不再是 production 主路线或硬门槛。
+- D3 完成态故障信号门禁仍未关闭：需要厂商认可的 `sync rc==0 && result!=0` 实机结果。当前 V1.4.0 驱动路径将 result 固定为零，fake HAL 或 timeout 不能替代该门禁。
+- 后续仍需完成目标模型所需算子及全模型集成，验证数值、GGUF/SSD 连续 decode、长稳态、故障恢复、性能，以及现有后端回归。
 
-## 三层实现
+阶段验收记录见 [Issue #6](https://github.com/fixedpointworks/ds4/issues/6)；环境验证脚本与结果只保留在 ignored 的 `misc/`。
 
-```text
-ds4.c / GGUF / SSD / KV
-        -> ds4_tcim.c      ds4_gpu_*、shape/variant、weight residency
-        -> xh2rt.c         BO、.xh2k、command batch、launch/sync/error
-        -> libhal_xh2a     allocator、transfer、IPU group/KLD
+## 方案
 
-build: operator source -> op.xh2k + generated typed C descriptor/stub
-```
-
-`xh2rt` 不知道 DS4、GGUF 或模型 slot。descriptor 与 `.xh2k` 由同一 canonical ABI IR 生成；runtime 在申请 kernel BO 前核对 payload/descriptor hash pair。
-
-## 已定标的约束
-
-- KLD 地址和 kernel 内 DDR pointer 使用 `IPU_IOMAP(global) = global - 0x1000000000`；HAL transfer 仍使用 global address。XH2A 1.4.0 driver 的 `xh2a_ipu_config.h` 定义了该映射，hq50 noop/store probe 也验证了 global pointer 超时而 IOMAP pointer 连续三次正确回读。
-- `ds4_gpu_tensor.ptr` 保存可做 `ptr + offset` 的 IOMAP 地址；adapter registry 另持有 HAL BO/global address/size/lifetime。
-- HAL group 是阻塞 command batch：最多 255 个 KLD、SPM 参数合计不超过 1 MiB，同组 core/tile/param type 必须一致。
-- cache-mode hardware descriptor 只保留 16-bit `kernel_size`；首版 `.xh2k` 拒绝 payload `> 65535` bytes。
-- HAL 返回值按 `rc != 0` 判错；sync timeout/device reset 后 poison context，KV/logits/output 不得继续使用或静默 fallback。
-
-## 下一阶段门禁
-
-1. `.xh2k` pack/hash、BO registry、2-core/4-tile fill/add、同组连续 launch 和负测；
-2. 按目标模型实际可达的 `ds4_gpu_*` manifest 实现 required primitives，逐算子对 CPU/CUDA oracle；
-3. 分段验证 attention/KV、MoE 和 output head，再做 raw GGUF + SSD cache 的连续 decode；
-4. 最后关闭长稳态、OOM/timeout/reinit、性能及 CPU/Metal/CUDA/ROCm 回归。
-
-实现规格与验收门见 [GitHub Issue #6](https://github.com/fixedpointworks/ds4/issues/6)，backend identity 见 [ADR-0004](../adr/0004-tcim-reuses-cuda-backend-identity.md)。
+- TCIM 独立构建，复用 DS4 的 GPU 接口和 CUDA backend identity，但不复用 CUDA runtime、kernel 或 capability，见 [ADR-0004](../adr/0004-tcim-reuses-cuda-backend-identity.md)。
+- DS4 宿主代码管理模型、权重、KV、GGUF/SSD cache 和算子调度；`xh2rt` 只负责设备资源与执行，不承担模型策略。
+- host 保持纯 C，直接调用 HAL；设备 kernel 使用 HDPL/Primitive 构建后内嵌，运行时不依赖 HDPL 编译器或外部 kernel 文件。
+- 采用 SDK 原生参数 ABI，由 host wrapper 与设备入口共同维护参数契约，不引入自定义描述块、模块容器或签名匹配。调用方负责算子参数正确性；runtime 保留资源安全和 HAL 错误处理，设备故障后不得复用无效结果或静默 fallback。
+- 官方 Dots TCIM 路径仅作为 ABI/数值参考，entry-only relink 不作为生产路线或验收前提。

@@ -52,11 +52,13 @@ testing the API surface.
 
 - Use `ssh hq50` to access the target host. Run `hm_smi -a` there to inspect
   the available XH2 devices.
-- Before building or testing, sync the local worktree to
-  `hq50:/home/sky/ds4/`, excluding `.git/` and files matched by `.gitignore`:
+- Before remote builds or tests, refresh `tcim/*.hex` locally with HDPL
+  (hq50 only has the HAL SDK). Sync the worktree first, then the ignored hex
+  files separately:
 
   ```sh
   rsync -az --exclude='.git/' --filter=':- .gitignore' ./ hq50:/home/sky/ds4/
+  rsync -az tcim/*.hex hq50:/home/sky/ds4/tcim/
   ```
 
 At every major change where one of the following could be affected, make sure to:

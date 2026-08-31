@@ -1,0 +1,135 @@
+/* Native SDK arguments use one 64-bit slot per address or scalar. */
+#include <stdint.h>
+
+#include "device/CppInclude.h"
+
+static __device__ inline void xh2rt_add_f32_direct(
+        uint64_t lhs_addr, uint64_t rhs_addr, uint64_t dst_addr,
+        uint64_t stripe_count, uint32_t hart_id) {
+    const volatile fp32_t *lhs =
+        reinterpret_cast<const volatile fp32_t *>(lhs_addr);
+    const volatile fp32_t *rhs =
+        reinterpret_cast<const volatile fp32_t *>(rhs_addr);
+    volatile fp32_t *dst = reinterpret_cast<volatile fp32_t *>(dst_addr);
+    const uint64_t lane = hart_id & 3u;
+
+    for (uint64_t i = lane; i < stripe_count; i += 4)
+        dst[i] = lhs[i] + rhs[i];
+    RISCV_FENCE_RW_RW;
+}
+
+__global__ extern "C" void add_f32(uint64_t lhs_addr,
+                                 uint64_t rhs_addr,
+                                 uint64_t dst_addr,
+                                 uint64_t count) {
+    if (count == 0) return;
+    /* Primitive TensorDesc shapes are uint32_t in the frozen toolchain. */
+    if (count > UINT32_MAX) return;
+
+    const auto active_info = device::target::getActiveInfo();
+    const uint32_t hart_id = device::target::getHartId();
+    const uint32_t core_id = device::target::getPhysicalCoreId();
+    const uint32_t tile_id = device::target::getTileId();
+    if (core_id >= 2 || tile_id >= 4) return;
+
+    const uint64_t stripe = (uint64_t)core_id * 4 + tile_id;
+    const uint64_t quotient = count / 8;
+    const uint64_t remainder = count % 8;
+    const uint64_t start =
+        quotient * stripe + (stripe < remainder ? stripe : remainder);
+    const uint64_t stripe_count = quotient + (stripe < remainder ? 1 : 0);
+
+    const uint64_t byte_offset = start * sizeof(fp32_t);
+    const uint64_t lhs_base = lhs_addr;
+    const uint64_t rhs_base = rhs_addr;
+    const uint64_t dst_base = dst_addr;
+    const uint64_t total_bytes = count * sizeof(fp32_t);
+    if (lhs_base == 0 || rhs_base == 0 || dst_base == 0 ||
+        (lhs_base & 3u) != 0 || (rhs_base & 3u) != 0 ||
+        (dst_base & 3u) != 0 ||
+        lhs_base > UINT64_MAX - total_bytes ||
+        rhs_base > UINT64_MAX - total_bytes ||
+        dst_base > UINT64_MAX - total_bytes)
+        return;
+    lhs_addr += byte_offset;
+    rhs_addr += byte_offset;
+    dst_addr += byte_offset;
+
+    device::Context context{};
+    context.deviceId = 0;
+    context.corePhyId = active_info.physicalCoreId[active_info.logicalCoreId];
+    context.coreId = active_info.logicalCoreId;
+    context.tileId = active_info.tileId;
+    context.hartId = (uint8_t)hart_id;
+    context.setChipVersion();
+    context.compatVersion = 1;
+    context.hartLogicId = (uint8_t)(hart_id % 16);
+    context.enabledRvvNumPerTile = 4;
+    context.enabledVpNumPerTile = 4;
+    context.numOfCores = 2;
+    context.numOfMpus = 0;
+    context.numOfMpuGroup = 0;
+    context.numOfInput = 2;
+    context.stopAtPrimitiveOpIndex = UINT64_MAX;
+    context.activeInfo = (void *)&active_info;
+
+    const uint64_t lane = hart_id & 3u;
+    const bool lane_active = lane < stripe_count;
+    const uint32_t lane_count = lane_active
+        ? (uint32_t)(1 + (stripe_count - 1 - lane) / 4)
+        : 0;
+    const uint64_t lane_offset = lane_active
+        ? lane * sizeof(fp32_t)
+        : 0;
+
+    /* Primitive TensorDesc GM addresses are offsets into Context memspaces,
+       not absolute IOMAP values.  Keep the three bases live through sync. */
+    const uint64_t variable_memspaces[3] = {
+        dst_addr + lane_offset,
+        lhs_addr + lane_offset,
+        rhs_addr + lane_offset,
+    };
+    context.variableMemSpaces = variable_memspaces;
+
+    const uint32_t gm_memspace =
+        (uint32_t)device::Context::GM_MEMSPACE_START;
+    const device::KernelConfig config{};
+    std::array<device::TensorDesc, 3U> tensors = {
+        device::TensorDesc{{lane_count}, {4 * sizeof(fp32_t)},
+                           device::Layout::getFromEncoding(0), 0,
+                           gm_memspace,
+                           device::Dtype::FP32,
+                           device::AddrMode::UNIVERSAL},
+        device::TensorDesc{{lane_count}, {4 * sizeof(fp32_t)},
+                           device::Layout::getFromEncoding(0), 0,
+                           gm_memspace + 1,
+                           device::Dtype::FP32,
+                           device::AddrMode::UNIVERSAL},
+        device::TensorDesc{{lane_count}, {4 * sizeof(fp32_t)},
+                           device::Layout::getFromEncoding(0), 0,
+                           gm_memspace + 2,
+                           device::Dtype::FP32,
+                           device::AddrMode::UNIVERSAL},
+    };
+
+    /* The Primitive does not publish an in-place ordering guarantee.  Keep
+       exact source/destination aliasing correct for the stateful counter gate. */
+    if (dst_base == lhs_base || dst_base == rhs_base) {
+        xh2rt_add_f32_direct(lhs_addr, rhs_addr, dst_addr, stripe_count,
+                             hart_id);
+    } else if (lane_active) {
+        /* HmintAddGm does not partition a one-dimensional TensorDesc by hart;
+           each active hart owns one interleaved lane of its tile stripe. */
+        primitive_hmint_add_gm(context, config, tensors, false, false);
+    }
+
+    /* Inactive harts and empty stripes must reach the same common epilogue.
+       Rendezvous both cores before the final per-core drain so core 0's group
+       interrupt cannot race core 1's final GM stores. */
+    device::barrierForTilesInAllCores(context, true);
+    device::waitForEverythingDoneInThisCoreBeforeKernelExit(context);
+}
+
+int main(void) {
+    return 0;
+}

@@ -16,6 +16,8 @@ QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
+TCIM_SRCS := $(wildcard tcim/*.hdpl)
+TCIM_HEX := $(TCIM_SRCS:.hdpl=.hex)
 DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
@@ -58,10 +60,12 @@ ROCM_HOST_CFLAGS ?= -fPIC
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
 HOUMO_SDK_PREFIX ?= /usr/local/houmo-sdk
-TCIM_HAL_LIB_DIR ?= $(HOUMO_SDK_PREFIX)/hal/lib
-TCIM_HAL_LDLIBS := -L$(TCIM_HAL_LIB_DIR) -Wl,-rpath,$(TCIM_HAL_LIB_DIR) -lhal_xh2a
+HOUMO_PREFIX ?= /usr/local/houmo
+TCIM_HDPLFLAGS ?= -fPIC -fhdpl-device-stdlib=hdpl -DHDPL_CC -std=c++17 -O2 -ffunction-sections -fdata-sections -DHM_PLATFORM=2 -DTARGET_XH2 -mcpu=houmo-m50 -I$(HOUMO_PREFIX)/include/Primitive/device -I$(HOUMO_PREFIX)/include/Primitive -I$(HOUMO_PREFIX)/include
+TCIM_HDPL_LDLIBS := -L$(HOUMO_PREFIX)/lib/Primitive -L$(HOUMO_PREFIX)/lib -lhdplrt -Wl,--allow-shlib-undefined --hdpl-link-lib=xh2_primitive_native_normal
+TCIM_HAL_LDLIBS := -L$(HOUMO_SDK_PREFIX)/hal/lib -Wl,-rpath,$(HOUMO_SDK_PREFIX)/hal/lib -lhal_xh2a
 TCIM_CFLAGS = $(CFLAGS) -I. -I$(HOUMO_SDK_PREFIX)/hal/include -I$(HOUMO_SDK_PREFIX)/hal/export/include -DDS4_TCIM_BUILD
-TCIM_CORE_OBJS := ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_tcim.o ds4_layer_pack.o
+TCIM_CORE_OBJS := ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_tcim.o ds4_layer_pack.o tcim/xh2rt.o
 TCIM_OBJS := ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(TCIM_CORE_OBJS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
@@ -163,7 +167,7 @@ help:
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make tcim                Build TCIM-only ./ds4 with the XH2 HAL"
-	@echo "  make test-tcim           Build TCIM ./ds4 and run the Step 1 host smoke"
+	@echo "  make test-tcim           Build TCIM and test DS4 CLI/link integration"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -195,8 +199,8 @@ strix-halo:
 
 rocm: strix-halo
 
-tcim:
-	$(MAKE) -B ds4 \
+tcim: $(TCIM_HEX)
+	$(MAKE) -B $(foreach file,$(TCIM_HEX),-o $(file)) ds4 \
 		CORE_OBJS="$(TCIM_CORE_OBJS)" \
 		CFLAGS="$(TCIM_CFLAGS)" \
 		DS4_LINK="$(CC) $(TCIM_CFLAGS)" \
@@ -395,8 +399,25 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-ds4_tcim.o: ds4_tcim.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h tcim/ds4_tcim_support.def
+ds4_tcim.o: ds4_tcim.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_tcim.c
+
+# Entry names match filenames so parallel HDPL links don't share a debug ELF.
+# Only hex is retained; raw code must fit the hardware's 16-bit length field.
+tcim/%.hex: tcim/%.hdpl
+	HDPL_PATH="$(HOUMO_PREFIX)" HDPLCC_PATH="$(HOUMO_PREFIX)" TMPDIR="$(abspath $(@D))" HM_PLATFORM=2 $(HOUMO_PREFIX)/bin/hdplc++ $(TCIM_HDPLFLAGS) -x hdpl $< -o $(@:.hex=.o) $(TCIM_HDPL_LDLIBS)
+	$(HOUMO_PREFIX)/bin/llvm-objcopy $(@:.hex=.o) --dump-section=.hdpl_fatbin=$(@:.hex=.elf)
+	$(HOUMO_PREFIX)/bin/llvm-objcopy $(@:.hex=.elf) --dump-section=$*=$(@:.hex=.bin)
+	@payload_bytes=$$(wc -c < "$(@:.hex=.bin)"); \
+	if [ "$$payload_bytes" -lt 1 ] || [ "$$payload_bytes" -gt 65535 ]; then \
+		echo "$*: payload size $$payload_bytes is outside 1..65535" >&2; \
+		exit 1; \
+	fi
+	xxd -i < $(@:.hex=.bin) > $@
+	rm -f $(@:.hex=.o) $(@:.hex=.elf) $(@:.hex=.bin) $(@:.hex=.debug.elf) $(@D)/kernel_entry.hbin
+
+tcim/xh2rt.o: tcim/xh2rt.c tcim/xh2rt.h $(TCIM_HEX)
+	$(CC) $(TCIM_CFLAGS) -c -o $@ $<
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -547,4 +568,5 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f $(TCIM_HEX) tcim/*.elf tcim/*.bin tcim/*.hbin
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o tcim/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

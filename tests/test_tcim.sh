@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# TCIM test entry point. Step 1 currently contains only the #5 host smoke;
-# #8 will aggregate the #6 runtime and #7 static-span device tests here.
+# DS4 TCIM CLI selection, memory-budget discovery and link-isolation regressions.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -275,4 +274,4 @@ if awk '$NF ~ /^ds4_gpu_[[:alnum:]_]+$/ { print }' \
 fi
 pass "single strong TCIM ds4_gpu_* provider"
 
-printf 'test_tcim: all #5 host checks passed\n'
+printf 'test_tcim: DS4 CLI and link-isolation tests passed\n'
