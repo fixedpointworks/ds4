@@ -273,6 +273,12 @@ static xh2rt_result xh2rt_require_healthy(xh2rt_context *context,
     return result;
 }
 
+int xh2rt_context_is_healthy(const xh2rt_context *context)
+{
+    return context != NULL && context->state == XH2RT_CONTEXT_OPEN &&
+           !context->poisoned;
+}
+
 static xh2rt_result xh2rt_require_view(
     xh2rt_context *context, const xh2rt_buffer_view *candidate,
     const char *operation, xh2rt_buffer_view **out_view)

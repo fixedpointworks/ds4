@@ -62,6 +62,9 @@ xh2rt_result xh2rt_context_open(uint32_t logical_device,
                                 xh2rt_context **out_context);
 xh2rt_result xh2rt_context_close(xh2rt_context **context);
 xh2rt_result xh2rt_context_last_error(const xh2rt_context *context);
+/* Host-only query for adapter init/device shims; a preflight error need not
+ * poison the context, so last_error alone cannot determine readiness. */
+int xh2rt_context_is_healthy(const xh2rt_context *context);
 
 /*
  * Commands are blocking groups, not asynchronous streams.  A typed launch

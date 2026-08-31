@@ -77,7 +77,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-tcim test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm tcim
+.PHONY: all help clean test test-tcim check-tcim-contract regen-tcim-contract test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm tcim
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -232,10 +232,19 @@ test-rocm:
 	./tests/test_gpu_args_cli.sh
 
 test-tcim: tcim
+	python3 tools/gen_tcim_contract.py --check-link --objects $(TCIM_OBJS) --binary ./ds4
 	DS4_TCIM_BIN=./ds4 \
 	DS4_TCIM_OBJECTS="$(TCIM_OBJS)" \
 	DS4_TCIM_LINK_ARGS="$(TCIM_CFLAGS) $(TCIM_OBJS) $(LDLIBS) $(TCIM_HAL_LDLIBS)" \
 	./tests/test_tcim.sh
+
+# AST regeneration is a development check, not a dependency of HAL-only builds.
+regen-tcim-contract:
+	python3 tools/gen_tcim_contract.py --write
+
+check-tcim-contract: tcim
+	python3 tools/gen_tcim_contract.py --check
+	python3 tools/gen_tcim_contract.py --check-link --objects $(TCIM_OBJS) --binary ./ds4
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -469,7 +478,7 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-ds4_tcim.o: ds4_tcim.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
+ds4_tcim.o: ds4_tcim.c ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h tcim/xh2rt.h tcim/ds4_tcim_stubs.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4_tcim.c
 
 # Entry names match filenames so parallel HDPL links don't share a debug ELF.
