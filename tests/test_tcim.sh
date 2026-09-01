@@ -251,11 +251,11 @@ if [[ -s "$TMP_DIR/duplicate-gpu-defs" ]]; then
     fail "more than one TCIM object defines the same ds4_gpu_* symbol"
 fi
 
-awk '$2 ~ /^[WwVv]$/ { print }' "$TMP_DIR/gpu-defs" \
-    >"$TMP_DIR/weak-gpu-defs"
-if [[ -s "$TMP_DIR/weak-gpu-defs" ]]; then
-    show_file "$TMP_DIR/weak-gpu-defs"
-    fail "TCIM ds4_gpu_* providers must be strong definitions"
+awk '$2 != "T" { print }' "$TMP_DIR/gpu-defs" \
+    >"$TMP_DIR/non-function-gpu-defs"
+if [[ -s "$TMP_DIR/non-function-gpu-defs" ]]; then
+    show_file "$TMP_DIR/non-function-gpu-defs"
+    fail "TCIM ds4_gpu_* providers must be strong function definitions"
 fi
 
 while IFS=$'\t' read -r object type symbol; do
@@ -266,7 +266,8 @@ while IFS=$'\t' read -r object type symbol; do
 done <"$TMP_DIR/gpu-defs"
 
 nm -u "$BIN" >"$TMP_DIR/binary-undefined"
-if awk '$NF ~ /^ds4_gpu_[[:alnum:]_]+$/ { print }' \
+if awk '{ name = $NF; sub(/@.*/, "", name); \
+          if (name ~ /^ds4_gpu_[[:alnum:]_]+$/) print }' \
     "$TMP_DIR/binary-undefined" >"$TMP_DIR/unresolved-gpu" &&
    [[ -s "$TMP_DIR/unresolved-gpu" ]]; then
     show_file "$TMP_DIR/unresolved-gpu"
