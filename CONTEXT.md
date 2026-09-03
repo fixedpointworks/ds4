@@ -36,3 +36,15 @@ _Avoid_: TCIM expert cache
 
 **TCIM backend（TCIM 后端）**:
 DS4 中通过 TCIM 执行模型推理的后端。
+
+**Kernel invocation（kernel invocation）**:
+TCIM 后端实际提交给 XH2 的一次 kernel 执行。
+_Avoid_: KLD, kernel call
+
+**Kernel outcome（kernel outcome）**:
+XH2 hart 为一次 kernel invocation 发布的执行结果；它与 HAL 调用返回值和 HAL 同步结果是不同概念。
+_Avoid_: Kernel status
+
+**Completion record（completion record）**:
+由 XH2 runtime 为一次 kernel invocation 持有、用于收集各 hart kernel outcome 的记录。
+_Avoid_: Kernel env, status record

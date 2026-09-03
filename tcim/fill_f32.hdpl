@@ -1,71 +1,86 @@
 /* Native SDK arguments are 64-bit slots; value_bits is widened unchanged. */
 #include <stdint.h>
 
-#include "kernel_status.hdplh"
+#ifndef HDPL_CC
 
-__global__ extern "C" void fill_f32(uint64_t dst_addr,
-                                  uint64_t status_addr,
-                                  uint64_t value_bits_arg,
-                                  uint64_t count) {
-    const auto active_info = device::target::getActiveInfo();
-    const uint32_t hart_id = device::target::getHartId();
-    const uint32_t core_id = device::target::getPhysicalCoreId();
-    const uint32_t tile_id = device::target::getTileId();
-    device::Context context{};
-    xh2rt_kernel_context(context, active_info, 0);
+#include "xh2rt_kernel.h"
 
-    uint32_t status = XH2RT_KERNEL_OK;
-    if (!xh2rt_kernel_status_address_ok(status_addr) ||
-        count > UINT64_MAX / sizeof(uint32_t) ||
+int xh2rt_fill_f32(xh2rt_context *context, xh2rt_buffer_view *destination, uint32_t value_bits, uint64_t count)
+{
+    xh2rt_kernel_slot slots[3];
+    uint64_t bytes;
+
+    if (count > UINT64_MAX / sizeof(uint32_t))
+        return xh2rt_kernel_reject(context, XH2RT_KERNEL_REJECT_OVERFLOW,
+                                   "fill_f32.count");
+    bytes = count * sizeof(uint32_t);
+    slots[0] = xh2rt_kernel_buffer(
+        destination, 0, bytes, count != 0 ? sizeof(uint32_t) : 1);
+    slots[1] = xh2rt_kernel_word(value_bits);
+    slots[2] = xh2rt_kernel_word(count);
+    return xh2rt_kernel_invoke(
+        context, "fill_f32", slots,
+        sizeof(slots) / sizeof(slots[0]), count != 0);
+}
+
+#else
+
+#include "xh2rt_kernel.h"
+
+__global__ extern "C" void fill_f32(uint64_t completion_iomap,
+                                    uint64_t dst_addr,
+                                    uint64_t value_bits_arg,
+                                    uint64_t count) {
+    xh2rt_kernel_scope scope{};
+
+    uint32_t outcome = xh2rt_kernel_scope_begin(
+        scope, completion_iomap, 0);
+    if (outcome == XH2RT_KERNEL_OUTCOME_OK &&
+        (count > UINT64_MAX / sizeof(uint32_t) ||
         (count != 0 && (dst_addr == 0 || (dst_addr & 3u) != 0 ||
-         dst_addr > UINT64_MAX - count * sizeof(uint32_t))))
-        status = XH2RT_KERNEL_INVALID_ARGUMENT;
+         dst_addr > UINT64_MAX - count * sizeof(uint32_t)))))
+        outcome = XH2RT_KERNEL_OUTCOME_INVALID_ARGUMENT;
 
-    /* Split without multiplying count by the eight-stripe index. */
-    const uint64_t stripe = (uint64_t)core_id * 4 + tile_id;
-    const uint64_t quotient = count / 8;
-    const uint64_t remainder = count % 8;
-    const uint64_t start =
-        quotient * stripe + (stripe < remainder ? stripe : remainder);
-    const uint64_t stripe_count = quotient + (stripe < remainder ? 1 : 0);
+    if (outcome == XH2RT_KERNEL_OUTCOME_OK) {
+        /* Split without multiplying count by the eight-stripe index. */
+        const uint64_t stripe = scope.core_tile_index;
+        const uint64_t quotient = count / XH2RT_CORE_TILE_COUNT;
+        const uint64_t remainder = count % XH2RT_CORE_TILE_COUNT;
+        const uint64_t start =
+            quotient * stripe + (stripe < remainder ? stripe : remainder);
+        const uint64_t stripe_count =
+            quotient + (stripe < remainder ? 1 : 0);
 
-    /* Give each RV hart a contiguous, disjoint part of the tile stripe so
-       memcpy can grow one seed without overlapping another hart's range. */
-    const uint64_t lane = hart_id & 3u;
-    const uint64_t hart_quotient = stripe_count / 4;
-    const uint64_t hart_remainder = stripe_count % 4;
-    const uint64_t hart_start =
-        hart_quotient * lane +
-        (lane < hart_remainder ? lane : hart_remainder);
-    const uint64_t hart_count =
-        hart_quotient + (lane < hart_remainder ? 1 : 0);
+        /* Give each RV hart a contiguous, disjoint part of the tile stripe. */
+        const uint64_t lane = scope.hart_lane;
+        const uint64_t hart_quotient =
+            stripe_count / XH2RT_HARTS_PER_TILE;
+        const uint64_t hart_remainder =
+            stripe_count % XH2RT_HARTS_PER_TILE;
+        const uint64_t hart_start =
+            hart_quotient * lane +
+            (lane < hart_remainder ? lane : hart_remainder);
+        const uint64_t hart_count =
+            hart_quotient + (lane < hart_remainder ? 1 : 0);
 
-    if (status == XH2RT_KERNEL_OK && hart_count != 0) {
-        const uint64_t element_offset = start + hart_start;
-        const uint64_t byte_offset = element_offset * sizeof(uint32_t);
-        uint8_t *dst = reinterpret_cast<uint8_t *>(dst_addr + byte_offset);
+        if (hart_count != 0) {
+            const uint64_t element_offset = start + hart_start;
+            volatile uint32_t *dst =
+                reinterpret_cast<volatile uint32_t *>(dst_addr) +
+                element_offset;
+            const uint32_t value_bits = (uint32_t)value_bits_arg;
 
-        /* Seed GM with the raw bits, then let the HDPL memcpy Primitive grow
-           the initialized prefix.  A direct store avoids passing a hart-local
-           stack address to the Primitive and preserves NaNs and signed zero. */
-        *reinterpret_cast<volatile uint32_t *>(dst) = (uint32_t)value_bits_arg;
-        RISCV_FENCE_RW_RW;
-
-        const uint64_t hart_bytes = hart_count * sizeof(uint32_t);
-        uint64_t filled_bytes = sizeof(uint32_t);
-        while (filled_bytes < hart_bytes) {
-            const uint64_t remaining = hart_bytes - filled_bytes;
-            const uint64_t copy_bytes =
-                filled_bytes < remaining ? filled_bytes : remaining;
-            memcpy(dst + filled_bytes, dst, (size_t)copy_bytes);
-            filled_bytes += copy_bytes;
+            for (uint64_t i = 0; i < hart_count; ++i)
+                dst[i] = value_bits;
+            RISCV_FENCE_RW_RW;
         }
-        RISCV_FENCE_RW_RW;
     }
 
-    xh2rt_kernel_complete(context, status_addr, status);
+    xh2rt_kernel_scope_finish(scope, outcome);
 }
 
 int main(void) {
     return 0;
 }
+
+#endif

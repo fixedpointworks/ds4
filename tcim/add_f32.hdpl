@@ -1,52 +1,78 @@
 /* Native SDK arguments use one 64-bit slot per address or scalar. */
 #include <stdint.h>
 
+#ifndef HDPL_CC
+
+#include "xh2rt_kernel.h"
+
+int xh2rt_add_f32(xh2rt_context *context, xh2rt_buffer_view *lhs, xh2rt_buffer_view *rhs, xh2rt_buffer_view *destination, uint64_t count)
+{
+    xh2rt_kernel_slot slots[4];
+    uint64_t bytes;
+    uint64_t alignment;
+
+    if (count > UINT64_MAX / sizeof(uint32_t))
+        return xh2rt_kernel_reject(context, XH2RT_KERNEL_REJECT_OVERFLOW,
+                                   "add_f32.count");
+    if (count > UINT32_MAX)
+        return xh2rt_kernel_reject(
+            context, XH2RT_KERNEL_REJECT_OUT_OF_RANGE, "add_f32.count");
+    bytes = count * sizeof(uint32_t);
+    alignment = count != 0 ? sizeof(uint32_t) : 1;
+    slots[0] = xh2rt_kernel_buffer(lhs, 0, bytes, alignment);
+    slots[1] = xh2rt_kernel_buffer(rhs, 0, bytes, alignment);
+    slots[2] = xh2rt_kernel_buffer(destination, 0, bytes, alignment);
+    slots[3] = xh2rt_kernel_word(count);
+    return xh2rt_kernel_invoke(
+        context, "add_f32", slots,
+        sizeof(slots) / sizeof(slots[0]), count != 0);
+}
+
+#else
+
 #include "device/CppInclude.h"
-#include "kernel_status.hdplh"
+#include "xh2rt_kernel.h"
 
 static __device__ inline void xh2rt_add_f32_direct(
         uint64_t lhs_addr, uint64_t rhs_addr, uint64_t dst_addr,
-        uint64_t stripe_count, uint32_t hart_id) {
+        uint64_t stripe_count, uint32_t hart_lane) {
     const volatile fp32_t *lhs =
         reinterpret_cast<const volatile fp32_t *>(lhs_addr);
     const volatile fp32_t *rhs =
         reinterpret_cast<const volatile fp32_t *>(rhs_addr);
     volatile fp32_t *dst = reinterpret_cast<volatile fp32_t *>(dst_addr);
-    const uint64_t lane = hart_id & 3u;
 
-    for (uint64_t i = lane; i < stripe_count; i += 4)
+    for (uint64_t i = hart_lane; i < stripe_count;
+         i += XH2RT_HARTS_PER_TILE)
         dst[i] = lhs[i] + rhs[i];
     RISCV_FENCE_RW_RW;
 }
 
-__global__ extern "C" void add_f32(uint64_t lhs_addr,
+__global__ extern "C" void add_f32(uint64_t completion_iomap,
+                                 uint64_t lhs_addr,
                                  uint64_t rhs_addr,
                                  uint64_t dst_addr,
-                                 uint64_t status_addr,
                                  uint64_t count) {
-    const auto active_info = device::target::getActiveInfo();
-    const uint32_t hart_id = device::target::getHartId();
-    const uint32_t core_id = device::target::getPhysicalCoreId();
-    const uint32_t tile_id = device::target::getTileId();
-    device::Context context{};
-    xh2rt_kernel_context(context, active_info, 2);
+    xh2rt_kernel_scope scope{};
 
-    uint32_t status = XH2RT_KERNEL_OK;
+    uint32_t outcome = xh2rt_kernel_scope_begin(
+        scope, completion_iomap, 2);
     /* Primitive TensorDesc shapes are uint32_t in the frozen toolchain. */
-    if (!xh2rt_kernel_status_address_ok(status_addr) || count > UINT32_MAX ||
+    if (outcome == XH2RT_KERNEL_OUTCOME_OK && (count > UINT32_MAX ||
         (count != 0 &&
          (lhs_addr == 0 || rhs_addr == 0 || dst_addr == 0 ||
           (lhs_addr & 3u) != 0 || (rhs_addr & 3u) != 0 ||
           (dst_addr & 3u) != 0 ||
           lhs_addr > UINT64_MAX - count * sizeof(fp32_t) ||
           rhs_addr > UINT64_MAX - count * sizeof(fp32_t) ||
-          dst_addr > UINT64_MAX - count * sizeof(fp32_t))))
-        status = XH2RT_KERNEL_INVALID_ARGUMENT;
+          dst_addr > UINT64_MAX - count * sizeof(fp32_t)))))
+        outcome = XH2RT_KERNEL_OUTCOME_INVALID_ARGUMENT;
 
-    const uint64_t work_count = status == XH2RT_KERNEL_OK ? count : 0;
-    const uint64_t stripe = (uint64_t)core_id * 4 + tile_id;
-    const uint64_t quotient = work_count / 8;
-    const uint64_t remainder = work_count % 8;
+    const uint64_t work_count =
+        outcome == XH2RT_KERNEL_OUTCOME_OK ? count : 0;
+    const uint64_t stripe = scope.core_tile_index;
+    const uint64_t quotient = work_count / XH2RT_CORE_TILE_COUNT;
+    const uint64_t remainder = work_count % XH2RT_CORE_TILE_COUNT;
     const uint64_t start =
         quotient * stripe + (stripe < remainder ? stripe : remainder);
     const uint64_t stripe_count = quotient + (stripe < remainder ? 1 : 0);
@@ -59,10 +85,11 @@ __global__ extern "C" void add_f32(uint64_t lhs_addr,
     rhs_addr += byte_offset;
     dst_addr += byte_offset;
 
-    const uint64_t lane = hart_id & 3u;
+    const uint64_t lane = scope.hart_lane;
     const bool lane_active = lane < stripe_count;
     const uint32_t lane_count = lane_active
-        ? (uint32_t)(1 + (stripe_count - 1 - lane) / 4)
+        ? (uint32_t)(1 + (stripe_count - 1 - lane) /
+            XH2RT_HARTS_PER_TILE)
         : 0;
     const uint64_t lane_offset = lane_active
         ? lane * sizeof(fp32_t)
@@ -75,23 +102,26 @@ __global__ extern "C" void add_f32(uint64_t lhs_addr,
         lhs_addr + lane_offset,
         rhs_addr + lane_offset,
     };
-    context.variableMemSpaces = variable_memspaces;
+    scope.context.variableMemSpaces = variable_memspaces;
 
     const uint32_t gm_memspace =
         (uint32_t)device::Context::GM_MEMSPACE_START;
     const device::KernelConfig config{};
     std::array<device::TensorDesc, 3U> tensors = {
-        device::TensorDesc{{lane_count}, {4 * sizeof(fp32_t)},
+        device::TensorDesc{{lane_count},
+                           {XH2RT_HARTS_PER_TILE * sizeof(fp32_t)},
                            device::Layout::getFromEncoding(0), 0,
                            gm_memspace,
                            device::Dtype::FP32,
                            device::AddrMode::UNIVERSAL},
-        device::TensorDesc{{lane_count}, {4 * sizeof(fp32_t)},
+        device::TensorDesc{{lane_count},
+                           {XH2RT_HARTS_PER_TILE * sizeof(fp32_t)},
                            device::Layout::getFromEncoding(0), 0,
                            gm_memspace + 1,
                            device::Dtype::FP32,
                            device::AddrMode::UNIVERSAL},
-        device::TensorDesc{{lane_count}, {4 * sizeof(fp32_t)},
+        device::TensorDesc{{lane_count},
+                           {XH2RT_HARTS_PER_TILE * sizeof(fp32_t)},
                            device::Layout::getFromEncoding(0), 0,
                            gm_memspace + 2,
                            device::Dtype::FP32,
@@ -102,19 +132,23 @@ __global__ extern "C" void add_f32(uint64_t lhs_addr,
        before any enters it. Use a launch-wide direct path for smaller vectors
        and exact aliases, whose in-place ordering the Primitive does not promise. */
     if (work_count != 0) {
-        if (count < 32 || dst_base == lhs_base || dst_base == rhs_base) {
+        if (count < XH2RT_HART_COUNT ||
+            dst_base == lhs_base || dst_base == rhs_base) {
             xh2rt_add_f32_direct(lhs_addr, rhs_addr, dst_addr, stripe_count,
-                                 hart_id);
+                                 scope.hart_lane);
         } else {
             /* HmintAddGm does not partition a one-dimensional TensorDesc by
                hart; each owns one interleaved lane of its tile stripe. */
-            primitive_hmint_add_gm(context, config, tensors, false, false);
+            primitive_hmint_add_gm(
+                scope.context, config, tensors, false, false);
         }
     }
 
-    xh2rt_kernel_complete(context, status_addr, status);
+    xh2rt_kernel_scope_finish(scope, outcome);
 }
 
 int main(void) {
     return 0;
 }
+
+#endif

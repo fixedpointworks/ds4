@@ -10,7 +10,6 @@
 #include "tcim/xh2rt.h"
 
 #include <errno.h>
-#include <inttypes.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,6 +25,9 @@ int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
 typedef struct tcim_tensor {
     ds4_gpu_tensor *tensor;
     xh2rt_buffer_view *view;
+    uintptr_t token;
+    uint64_t bytes;
+    int device_id;
     int heap_owned;
     struct tcim_tensor *next;
 } tcim_tensor;
@@ -33,37 +35,6 @@ typedef struct tcim_tensor {
 static xh2rt_context *tcim_context;
 static tcim_tensor *tcim_tensors;
 static int tcim_initialized;
-
-static int tcim_result_ok(xh2rt_result result) {
-    if (xh2rt_result_is_ok(result)) return 1;
-    int error = result.saved_errno;
-    if (error == 0) {
-        switch (result.status) {
-        case XH2RT_STATUS_NO_MEMORY: error = ENOMEM; break;
-        case XH2RT_STATUS_OVERFLOW: error = EOVERFLOW; break;
-        case XH2RT_STATUS_BUSY: error = EBUSY; break;
-        case XH2RT_STATUS_INVALID_ARGUMENT:
-        case XH2RT_STATUS_INVALID_STATE:
-        case XH2RT_STATUS_OUT_OF_RANGE:
-        case XH2RT_STATUS_MISALIGNED:
-        case XH2RT_STATUS_STALE_BUFFER: error = EINVAL; break;
-        default: error = EIO; break;
-        }
-    }
-    fprintf(stderr, "ds4: TCIM %s: %s (rc=%d errno=%d",
-            result.operation, xh2rt_status_string(result.status),
-            result.raw_rc, result.saved_errno);
-    if (result.group_id >= 0)
-        fprintf(stderr, " group=%" PRId64 " hal_sync_result=0x%08" PRIx32,
-                result.group_id, result.execution_result);
-    if (result.kernel_index != UINT32_MAX)
-        fprintf(stderr, " kernel=%" PRIu32 " stripe=%" PRIu32
-                " status=0x%08" PRIx32, result.kernel_index,
-                result.kernel_stripe, result.kernel_status);
-    fputs(")\n", stderr);
-    errno = error;
-    return 0;
-}
 
 static int tcim_ready(void) {
     if (tcim_initialized && xh2rt_context_is_healthy(tcim_context)) return 1;
@@ -78,23 +49,19 @@ static tcim_tensor *tcim_find_tensor(const ds4_gpu_tensor *tensor) {
     return NULL;
 }
 
-/* Tensor fields carry no ownership authority. Validate their token/extent
- * against the registered opaque view before the runtime can touch hardware. */
+/* Tensor fields carry no ownership authority. Validate them against immutable
+ * registration metadata; the runtime resolves the opaque view once per op. */
 static xh2rt_buffer_view *tcim_tensor_view(const ds4_gpu_tensor *tensor) {
     tcim_tensor *entry;
-    uintptr_t iomap;
-    uint64_t bytes;
     if (!tcim_ready()) return NULL;
     entry = tcim_find_tensor(tensor);
     if (entry == NULL || entry->view == NULL) {
         errno = EINVAL;
         return NULL;
     }
-    if (!tcim_result_ok(xh2rt_buffer_bytes(tcim_context, entry->view, &bytes)) ||
-        !tcim_result_ok(xh2rt_buffer_iomap(tcim_context, entry->view,
-                                          0, bytes, 1, &iomap))) return NULL;
-    if ((uintptr_t)tensor->ptr != iomap || tensor->bytes != bytes ||
-        tensor->device_id != 0) {
+    if ((uintptr_t)tensor->ptr != entry->token ||
+        tensor->bytes != entry->bytes ||
+        tensor->device_id != entry->device_id) {
         errno = EINVAL;
         return NULL;
     }
@@ -114,7 +81,7 @@ int ds4_gpu_init_multi(const ds4_gpu_config *config) {
         errno = EBUSY;
         return 0;
     }
-    if (!tcim_result_ok(xh2rt_context_open(0, &tcim_context))) return 0;
+    if (!xh2rt_context_open(0, &tcim_context)) return 0;
     memset(g_gpu, 0, sizeof(g_gpu));
     memset(g_gpu_peer_ok, 0, sizeof(g_gpu_peer_ok));
     g_gpu[0].device_id = 0;
@@ -137,7 +104,7 @@ void ds4_gpu_cleanup(void) {
     tcim_tensor *entry;
     const int primary_errno = errno;
     tcim_initialized = 0;
-    (void)tcim_result_ok(xh2rt_context_close(&tcim_context));
+    (void)xh2rt_context_close(&tcim_context);
     /* Callers still own their wrapper storage. Keep only that association so
      * free after cleanup is safe; no stale view can enter a later context. */
     for (entry = tcim_tensors; entry != NULL; entry = entry->next)
@@ -163,12 +130,11 @@ int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *tensor, int device_id,
     if (bytes == 0) bytes = 1;
     entry = calloc(1, sizeof(*entry));
     if (entry == NULL) return 1;
-    if (!tcim_result_ok(xh2rt_buffer_alloc(tcim_context, bytes, &entry->view))) {
+    if (!xh2rt_buffer_alloc(tcim_context, bytes, &entry->view)) {
         free(entry);
         return 1;
     }
-    if (!tcim_result_ok(xh2rt_buffer_iomap(tcim_context, entry->view,
-                                          0, bytes, 1, &iomap))) {
+    if (!xh2rt_buffer_iomap(tcim_context, entry->view, 0, bytes, 1, &iomap)) {
         int error = errno;
         (void)xh2rt_buffer_release(tcim_context, &entry->view);
         free(entry);
@@ -177,6 +143,9 @@ int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *tensor, int device_id,
     }
     *tensor = (ds4_gpu_tensor){(void *)(uintptr_t)iomap, bytes, 1, 0};
     entry->tensor = tensor;
+    entry->token = iomap;
+    entry->bytes = bytes;
+    entry->device_id = device_id;
     entry->next = tcim_tensors;
     tcim_tensors = entry;
     return 0;
@@ -213,13 +182,15 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
         free(tensor);
         return NULL;
     }
-    if (!tcim_result_ok(xh2rt_buffer_view_create(tcim_context, base_view,
-                                                 offset, bytes, &entry->view)))
+    if (!xh2rt_buffer_view_create(tcim_context, base_view, offset, bytes, &entry->view))
         goto fail;
-    if (!tcim_result_ok(xh2rt_buffer_iomap(tcim_context, entry->view,
-                                          0, bytes, 1, &iomap))) goto fail;
+    if (!xh2rt_buffer_iomap(tcim_context, entry->view, 0, bytes, 1, &iomap))
+        goto fail;
     *tensor = (ds4_gpu_tensor){(void *)(uintptr_t)iomap, bytes, 0, 0};
     entry->tensor = tensor;
+    entry->token = iomap;
+    entry->bytes = bytes;
+    entry->device_id = 0;
     entry->heap_owned = 1;
     entry->next = tcim_tensors;
     tcim_tensors = entry;
@@ -250,7 +221,7 @@ static void tcim_tensor_release(ds4_gpu_tensor *tensor, int free_wrapper) {
     /* Even when a void free cannot report failure, the runtime retains any
      * failed physical free in its registry for cleanup to retry safely. */
     if (entry->view != NULL)
-        (void)tcim_result_ok(xh2rt_buffer_release(tcim_context, &entry->view));
+        (void)xh2rt_buffer_release(tcim_context, &entry->view);
     memset(tensor, 0, sizeof(*tensor));
     tensor->device_id = -1;
     if (!free_wrapper && entry->heap_owned) {
@@ -284,16 +255,14 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset,
                            const void *data, uint64_t bytes) {
     xh2rt_buffer_view *view = tcim_tensor_view(tensor);
     if (view == NULL) return 0;
-    return tcim_result_ok(xh2rt_buffer_write(tcim_context, view, offset,
-                                             data, bytes));
+    return xh2rt_buffer_write(tcim_context, view, offset, data, bytes);
 }
 
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset,
                           void *data, uint64_t bytes) {
     xh2rt_buffer_view *view = tcim_tensor_view(tensor);
     if (view == NULL) return 0;
-    return tcim_result_ok(xh2rt_buffer_read(tcim_context, data, view,
-                                            offset, bytes));
+    return xh2rt_buffer_read(tcim_context, data, view, offset, bytes);
 }
 
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -302,8 +271,7 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     xh2rt_buffer_view *dst_view = tcim_tensor_view(dst);
     xh2rt_buffer_view *src_view = tcim_tensor_view(src);
     if (dst_view == NULL || src_view == NULL) return 0;
-    return tcim_result_ok(xh2rt_buffer_copy(tcim_context, dst_view, dst_offset,
-                                            src_view, src_offset, bytes));
+    return xh2rt_buffer_copy(tcim_context, dst_view, dst_offset, src_view, src_offset, bytes);
 }
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
@@ -312,11 +280,11 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
     uint32_t value_bits;
     if (view == NULL) return 0;
     memcpy(&value_bits, &value, sizeof(value_bits));
-    return tcim_result_ok(xh2rt_fill_f32(tcim_context, view, value_bits, count));
+    return xh2rt_fill_f32(tcim_context, view, value_bits, count);
 }
 
 int ds4_gpu_begin_commands(void) {
-    return tcim_ready() && tcim_result_ok(xh2rt_commands_begin(tcim_context));
+    return tcim_ready() && xh2rt_commands_begin(tcim_context);
 }
 
 int ds4_gpu_commands_active(void) {
@@ -324,7 +292,7 @@ int ds4_gpu_commands_active(void) {
 }
 
 int ds4_gpu_flush_commands(void) {
-    return tcim_ready() && tcim_result_ok(xh2rt_commands_flush(tcim_context));
+    return tcim_ready() && xh2rt_commands_flush(tcim_context);
 }
 
 int ds4_gpu_flush_encoder(void) {
@@ -332,11 +300,11 @@ int ds4_gpu_flush_encoder(void) {
 }
 
 int ds4_gpu_end_commands(void) {
-    return tcim_ready() && tcim_result_ok(xh2rt_commands_end(tcim_context));
+    return tcim_ready() && xh2rt_commands_end(tcim_context);
 }
 
 int ds4_gpu_synchronize(void) {
-    return tcim_ready() && tcim_result_ok(xh2rt_synchronize(tcim_context));
+    return tcim_ready() && xh2rt_synchronize(tcim_context);
 }
 
 int ds4_gpu_set_current_device(int tier) {
