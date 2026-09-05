@@ -10,6 +10,7 @@
 #include "tcim/xh2rt.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,9 +33,24 @@ typedef struct tcim_tensor {
     struct tcim_tensor *next;
 } tcim_tensor;
 
+typedef struct tcim_model_span {
+    uint64_t offset;
+    uint64_t bytes;
+    xh2rt_buffer_view *view;
+    uintptr_t iomap;
+} tcim_model_span;
+
+typedef struct tcim_model_store {
+    const void *map;
+    uint64_t size;
+    tcim_model_span *spans;
+    uint32_t span_count;
+} tcim_model_store;
+
 static xh2rt_context *tcim_context;
 static tcim_tensor *tcim_tensors;
 static int tcim_initialized;
+static tcim_model_store tcim_model;
 
 static int tcim_ready(void) {
     if (tcim_initialized && xh2rt_context_is_healthy(tcim_context)) return 1;
@@ -66,6 +82,182 @@ static xh2rt_buffer_view *tcim_tensor_view(const ds4_gpu_tensor *tensor) {
         return NULL;
     }
     return entry->view;
+}
+
+static void tcim_model_unpublish(void) {
+    tcim_model.map = NULL;
+    tcim_model.size = 0;
+}
+
+/* A failed final BO free leaves the runtime view valid for a later retry.
+ * Keep the span record until every view has actually been released. */
+static int tcim_model_release_spans(void) {
+    int first_error = 0;
+    int pending = 0;
+
+    if (tcim_model.spans == NULL) return 1;
+    for (uint32_t i = 0; i < tcim_model.span_count; i++) {
+        tcim_model_span *span = &tcim_model.spans[i];
+        if (span->view != NULL &&
+            !xh2rt_buffer_release(tcim_context, &span->view)) {
+            if (first_error == 0) first_error = errno != 0 ? errno : EIO;
+            fprintf(stderr,
+                    "ds4: TCIM release of model span %u [%" PRIu64
+                    ", +%" PRIu64 "] failed: %s\n",
+                    i, span->offset, span->bytes,
+                    strerror(errno != 0 ? errno : EIO));
+        }
+        if (span->view != NULL) pending = 1;
+    }
+    if (pending) {
+        errno = first_error != 0 ? first_error : EBUSY;
+        return 0;
+    }
+    free(tcim_model.spans);
+    tcim_model.spans = NULL;
+    tcim_model.span_count = 0;
+    return 1;
+}
+
+static void tcim_model_forget_spans(void) {
+    free(tcim_model.spans);
+    tcim_model.spans = NULL;
+    tcim_model.span_count = 0;
+}
+
+static int tcim_model_range_fits(uint64_t model_size, uint64_t offset,
+                                 uint64_t bytes) {
+    return offset <= model_size && bytes <= model_size - offset;
+}
+
+static int tcim_model_validate_spans(const void *model_map,
+                                     uint64_t model_size,
+                                     const uint64_t *offsets,
+                                     const uint64_t *sizes,
+                                     uint32_t count) {
+    const uintptr_t base = (uintptr_t)model_map;
+    uint64_t previous_end = 0;
+
+    if (model_map == NULL || model_size == 0 || offsets == NULL ||
+        sizes == NULL || count == 0) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (model_size > (uint64_t)SIZE_MAX ||
+        model_size > (uint64_t)UINTPTR_MAX - (uint64_t)base ||
+        (count != 0 &&
+         SIZE_MAX / (size_t)count < sizeof(tcim_model_span))) {
+        errno = EOVERFLOW;
+        return 0;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (sizes[i] == 0 || sizes[i] > (uint64_t)SIZE_MAX ||
+            !tcim_model_range_fits(model_size, offsets[i], sizes[i])) {
+            errno = sizes[i] > (uint64_t)SIZE_MAX ? EOVERFLOW : EINVAL;
+            fprintf(stderr,
+                    "ds4: TCIM model span %u [%" PRIu64 ", +%" PRIu64
+                    "] is outside the %" PRIu64 "-byte GGUF mapping\n",
+                    i, offsets[i], sizes[i], model_size);
+            return 0;
+        }
+        if (i != 0 && offsets[i] < previous_end) {
+            errno = EINVAL;
+            fprintf(stderr,
+                    "ds4: TCIM model span %u begins before the prior span "
+                    "ends at %" PRIu64 "\n",
+                    i, previous_end);
+            return 0;
+        }
+        previous_end = offsets[i] + sizes[i];
+    }
+    return 1;
+}
+
+static const tcim_model_span *tcim_model_find_span(uint64_t offset,
+                                                   uint64_t bytes,
+                                                   uint64_t *inner_offset) {
+    if (tcim_model.map == NULL ||
+        !tcim_model_range_fits(tcim_model.size, offset, bytes)) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < tcim_model.span_count; i++) {
+        const tcim_model_span *span = &tcim_model.spans[i];
+        if (span->view != NULL && offset >= span->offset) {
+            const uint64_t inner = offset - span->offset;
+            if (inner <= span->bytes && bytes <= span->bytes - inner) {
+                if (inner_offset != NULL) *inner_offset = inner;
+                return span;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int tcim_model_covers_spans(const void *model_map,
+                                   uint64_t model_size,
+                                   const uint64_t *offsets,
+                                   const uint64_t *sizes,
+                                   uint32_t count) {
+    if (tcim_model.map != model_map || tcim_model.size != model_size)
+        return 0;
+    for (uint32_t i = 0; i < count; i++)
+        if (tcim_model_find_span(offsets[i], sizes[i], NULL) == NULL)
+            return 0;
+    return 1;
+}
+
+static int tcim_model_resolve(const void *model_map, uint64_t model_size,
+                              uint64_t offset, uint64_t bytes) {
+    if (!tcim_ready()) return 0;
+    if (model_map == NULL || model_size == 0 || bytes == 0 ||
+        !tcim_model_range_fits(model_size, offset, bytes)) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (tcim_model.map != model_map || tcim_model.size != model_size) {
+        errno = ENOENT;
+        return 0;
+    }
+    if (tcim_model_find_span(offset, bytes, NULL) == NULL) {
+        errno = ENOENT;
+        return 0;
+    }
+    return 1;
+}
+
+static int tcim_model_stage_span(tcim_model_span *span,
+                                 const void *model_map,
+                                 uint64_t offset,
+                                 uint64_t bytes,
+                                 uint32_t index) {
+    const unsigned char *source =
+        (const unsigned char *)model_map + (size_t)offset;
+    const char *operation = "allocate";
+
+    memset(span, 0, sizeof(*span));
+    span->offset = offset;
+    span->bytes = bytes;
+    if (!xh2rt_buffer_alloc(tcim_context, bytes, &span->view))
+        goto fail;
+    operation = "copy";
+    if (!xh2rt_buffer_write(tcim_context, span->view, 0, source, bytes))
+        goto fail;
+    operation = "bind";
+    if (!xh2rt_buffer_iomap(tcim_context, span->view, 0, bytes, 1,
+                            &span->iomap))
+        goto fail;
+    return 1;
+
+fail:
+    {
+        const int error = errno != 0 ? errno : EIO;
+        fprintf(stderr,
+                "ds4: TCIM failed to %s model span %u [%" PRIu64
+                ", +%" PRIu64 "]: %s\n",
+                operation, index, offset, bytes, strerror(error));
+        errno = error;
+        return 0;
+    }
 }
 
 int ds4_gpu_init_multi(const ds4_gpu_config *config) {
@@ -103,8 +295,16 @@ int ds4_gpu_init(void) {
 void ds4_gpu_cleanup(void) {
     tcim_tensor *entry;
     const int primary_errno = errno;
+    int cleanup_error = 0;
+
+    /* Closing the context drains accepted work before freeing BOs. Model
+     * bindings are unpublished first, but their views stay runtime-owned
+     * until that ordered close completes. */
+    tcim_model_unpublish();
     tcim_initialized = 0;
-    (void)xh2rt_context_close(&tcim_context);
+    if (!xh2rt_context_close(&tcim_context) && cleanup_error == 0)
+        cleanup_error = errno != 0 ? errno : EIO;
+    if (tcim_context == NULL) tcim_model_forget_spans();
     /* Callers still own their wrapper storage. Keep only that association so
      * free after cleanup is safe; no stale view can enter a later context. */
     for (entry = tcim_tensors; entry != NULL; entry = entry->next)
@@ -114,6 +314,7 @@ void ds4_gpu_cleanup(void) {
     g_n_gpus = 1;
     g_gpu_peer_ok[0][0] = 1;
     if (primary_errno != 0) errno = primary_errno;
+    else if (cleanup_error != 0) errno = cleanup_error;
 }
 
 /* Allocate host bookkeeping first, so failure cannot strand a new device
@@ -867,30 +1068,66 @@ int ds4_gpu_build_derived_artifacts(const void * arg0, uint64_t arg1, const char
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
-int ds4_gpu_cache_model_range(const void * arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, const char * arg4)
-{
-    (void)arg0;
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-    (void)arg4;
-    errno = ENOSYS;
-    return 0;
+/* Static spans have already completed H2D when the shared CUDA-compatible
+ * preload pass reaches this hook. That pass may coalesce nearby tensors
+ * across GGUF padding, so validate its resident boundary tensors without
+ * manufacturing a contiguous binding for the gap. lookup_cache remains the
+ * authoritative test for a contiguous model-view binding. */
+int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size,
+                              uint64_t offset, uint64_t bytes,
+                              const char *label) {
+    (void)label;
+    if (model_map == NULL || model_size == 0 || bytes == 0 ||
+        !tcim_model_range_fits(model_size, offset, bytes)) {
+        errno = EINVAL;
+        return 0;
+    }
+    if (!tcim_model_resolve(model_map, model_size, offset, 1))
+        return 0;
+    return bytes == 1 ||
+           tcim_model_resolve(model_map, model_size,
+                              offset + bytes - 1u, 1);
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
-int ds4_gpu_cache_q8_f16_range(const void * arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, const char * arg6)
-{
-    (void)arg0;
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-    (void)arg4;
-    (void)arg5;
-    (void)arg6;
-    errno = ENOSYS;
-    return 0;
+/* TCIM consumes the GGUF's Q8 bytes directly. This cache hook establishes
+ * raw residency only; it never creates a dequantized F16 derivative. */
+int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size,
+                               uint64_t offset, uint64_t bytes,
+                               uint64_t in_dim, uint64_t out_dim,
+                               const char *label) {
+    (void)in_dim;
+    (void)out_dim;
+    (void)label;
+    return tcim_model_resolve(model_map, model_size, offset, bytes);
+}
+
+int ds4_gpu_lookup_cache(uint64_t source_offset, uint64_t bytes,
+                         int *out_device_id, void **out_device_ptr) {
+    const tcim_model_span *span;
+    uint64_t inner;
+    uintptr_t token;
+
+    if (!tcim_ready()) return 0;
+    if (bytes == 0) {
+        errno = EINVAL;
+        return 0;
+    }
+    span = tcim_model_find_span(source_offset, bytes, &inner);
+    if (span == NULL || inner > (uint64_t)UINTPTR_MAX - span->iomap) {
+        errno = span == NULL ? ENOENT : EOVERFLOW;
+        return 0;
+    }
+    token = span->iomap + (uintptr_t)inner;
+    if (out_device_id != NULL) *out_device_id = 0;
+    if (out_device_ptr != NULL) *out_device_ptr = (void *)token;
+    return 1;
+}
+
+int ds4_gpu_lookup_cache_device(uint64_t source_offset, uint64_t bytes) {
+    int device_id = -1;
+    return ds4_gpu_lookup_cache(source_offset, bytes, &device_id, NULL)
+               ? device_id
+               : -1;
 }
 
 /* TCIM_STUB: PRODUCT_REQUIRED_TODO: DS4 compute/operator closure belongs to later Steps 2-3; native fill/add runtime tests do not implement this API. */
@@ -1047,7 +1284,7 @@ int ds4_gpu_decode_graphs_supported(void)
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: OUT_OF_SCOPE_UNAVAILABLE: Secondary support and multi-tier caches are outside the primary single-device static-span path. */
 int ds4_gpu_device_cache_support_tensors(int arg0, int arg1, const ds4_tensor_range * arg2, int arg3, int arg4)
 {
     (void)arg0;
@@ -1059,7 +1296,7 @@ int ds4_gpu_device_cache_support_tensors(int arg0, int arg1, const ds4_tensor_ra
     return 1;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: OUT_OF_SCOPE_UNAVAILABLE: Selective multi-tier placement is outside the primary single-device static-span path. */
 int ds4_gpu_device_cache_tensors(int arg0, const ds4_tensor_range * arg1, int arg2)
 {
     (void)arg0;
@@ -2640,7 +2877,7 @@ int ds4_gpu_matmul_q8_0_top1_tensor(ds4_gpu_tensor * arg0, ds4_gpu_tensor * arg1
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model binding exists; this compute primitive belongs to the later operator closure. */
 int ds4_gpu_matmul_quant_decode_mpp_model_view_tensor(ds4_gpu_tensor * arg0, const void * arg1, uint64_t arg2, uint64_t arg3, uint32_t arg4, uint64_t arg5, uint64_t arg6, const ds4_gpu_tensor * arg7, uint64_t arg8)
 {
     (void)arg0;
@@ -2699,7 +2936,7 @@ int ds4_gpu_model_range_replaced(const void * arg0, uint64_t arg1, uint64_t arg2
     return 0;
 }
 
-/* TCIM_STUB: OPTIONAL_FALLBACK: No model residency is established by D4; all model registration/loading APIs fail closed until #7. */
+/* TCIM_STUB: OPTIONAL_FALLBACK: Explicit span installs are authoritative on the single TCIM device; there is no tier to skip. */
 void ds4_gpu_model_residency_skip(int arg0)
 {
     (void)arg0;
@@ -2784,7 +3021,7 @@ uint64_t ds4_gpu_recommended_working_set_size(void)
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: OUT_OF_SCOPE_UNAVAILABLE: Multi-tier no-copy registration is not the TCIM static-span binding seam. */
 int ds4_gpu_register_model_map_no_copy(const void * arg0, uint64_t arg1)
 {
     (void)arg0;
@@ -2793,7 +3030,7 @@ int ds4_gpu_register_model_map_no_copy(const void * arg0, uint64_t arg1)
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: OUT_OF_SCOPE_UNAVAILABLE: Secondary support mappings are outside the primary static-span path. */
 int ds4_gpu_register_support_map(const void * arg0, uint64_t arg1, uint64_t arg2)
 {
     (void)arg0;
@@ -3163,7 +3400,7 @@ int ds4_gpu_router_select_tensor(ds4_gpu_tensor * arg0, ds4_gpu_tensor * arg1, d
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: OUT_OF_SCOPE_UNAVAILABLE: Secondary/support model residency is not part of the primary static-span path. */
 int ds4_gpu_set_aux_model_map_range(const void * arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
 {
     (void)arg0;
@@ -3200,46 +3437,80 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool arg0)
     (void)arg0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
-int ds4_gpu_set_model_fd(int arg0)
-{
-    (void)arg0;
-    errno = ENOSYS;
+/* The shared GGUF loader owns both descriptors and mappings. TCIM borrows
+ * this association and never closes or reads the fd during cleanup. */
+int ds4_gpu_set_model_fd(int fd) {
+    (void)fd;
+    return 1;
+}
+
+int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
+    (void)fd;
+    (void)model_map;
+    return 1;
+}
+
+/* Whole-GGUF H2D is deliberately not a TCIM fallback. Shared inference
+ * installs bounded ranges/spans, which keeps the 24 GiB device path honest. */
+int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
+    (void)model_map;
+    (void)model_size;
+    errno = ENOTSUP;
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
-int ds4_gpu_set_model_fd_for_map(int arg0, const void * arg1)
-{
-    (void)arg0;
-    (void)arg1;
-    errno = ENOSYS;
-    return 0;
+int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size,
+                                uint64_t map_offset, uint64_t map_size,
+                                uint64_t max_tensor_bytes) {
+    return ds4_gpu_set_model_map_spans(model_map, model_size, &map_offset,
+                                       &map_size, 1, max_tensor_bytes);
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
-int ds4_gpu_set_model_map_range(const void * arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4)
-{
-    (void)arg0;
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-    (void)arg4;
-    errno = ENOSYS;
-    return 0;
-}
+int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size,
+                                const uint64_t *offsets,
+                                const uint64_t *sizes, uint32_t count,
+                                uint64_t max_tensor_bytes) {
+    int error;
+    (void)max_tensor_bytes;
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
-int ds4_gpu_set_model_map_spans(const void * arg0, uint64_t arg1, const uint64_t * arg2, const uint64_t * arg3, uint32_t arg4, uint64_t arg5)
-{
-    (void)arg0;
-    (void)arg1;
-    (void)arg2;
-    (void)arg3;
-    (void)arg4;
-    (void)arg5;
-    errno = ENOSYS;
-    return 0;
+    /* Validate every host range before opening a device or disturbing the
+     * currently published generation. */
+    if (!tcim_model_validate_spans(model_map, model_size, offsets, sizes,
+                                   count))
+        return 0;
+    if (!tcim_initialized && !ds4_gpu_init()) return 0;
+    if (!tcim_ready()) return 0;
+    if (tcim_model_covers_spans(model_map, model_size, offsets, sizes, count))
+        return 1;
+    if (xh2rt_commands_active(tcim_context)) {
+        errno = EBUSY;
+        return 0;
+    }
+
+    /* Remap is intentionally single-buffered: retire all old bindings before
+     * allocating the next generation. A failed remap therefore publishes an
+     * empty store, never a mixture of old and partially copied spans. */
+    tcim_model_unpublish();
+    if (!tcim_model_release_spans()) return 0;
+    tcim_model.spans = calloc((size_t)count, sizeof(*tcim_model.spans));
+    if (tcim_model.spans == NULL) {
+        errno = ENOMEM;
+        return 0;
+    }
+    tcim_model.span_count = count;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (!tcim_model_stage_span(&tcim_model.spans[i], model_map,
+                                   offsets[i], sizes[i], i)) {
+            error = errno != 0 ? errno : EIO;
+            (void)tcim_model_release_spans();
+            errno = error;
+            return 0;
+        }
+    }
+    tcim_model.map = model_map;
+    tcim_model.size = model_size;
+    return 1;
 }
 
 /* TCIM_STUB: OPTIONAL_FALLBACK: D4 has no Q8 weight cache; cache creation and dependent operators fail closed. */
@@ -3254,10 +3525,11 @@ void ds4_gpu_set_quality(bool arg0)
     (void)arg0;
 }
 
-/* TCIM_STUB: OPTIONAL_FALLBACK: D4 does not load model/expert storage; registration and load APIs fail closed until #7. */
-void ds4_gpu_set_ssd_streaming(bool arg0)
+/* Shared span installation owns static residency policy; selected-expert
+ * streaming configuration belongs to Step 2. */
+void ds4_gpu_set_ssd_streaming(bool enabled)
 {
-    (void)arg0;
+    (void)enabled;
 }
 
 /* TCIM_STUB: OPTIONAL_FALLBACK: D4 has no expert cache and all expert load APIs fail closed; budget cannot admit work. */
@@ -3336,7 +3608,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(ds4_gpu_tensor * arg0, ds4_gpu_ten
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model binding exists; this compute primitive belongs to the later operator closure. */
 int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(ds4_gpu_tensor * arg0, ds4_gpu_tensor * arg1, ds4_gpu_tensor * arg2, const void * arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6, uint64_t arg7, uint64_t arg8, const ds4_gpu_tensor * arg9, float arg10)
 {
     (void)arg0;
@@ -3487,7 +3759,7 @@ int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor * arg0, const ds4_gpu_tensor * ar
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Selected routed-expert loading belongs to Step 2. */
 int ds4_gpu_stream_expert_cache_begin_selected_load(const ds4_gpu_stream_expert_table * arg0, const int32_t * arg1, uint32_t arg2)
 {
     (void)arg0;
@@ -3517,7 +3789,7 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void)
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Selected routed-expert batch preparation belongs to Step 2. */
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(const ds4_gpu_stream_expert_table * arg0, const int32_t * arg1, uint32_t arg2, uint32_t arg3)
 {
     (void)arg0;
@@ -3528,12 +3800,12 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(const ds4_gpu_stream_expe
     return 0;
 }
 
-/* TCIM_STUB: OPTIONAL_FALLBACK: No resident expert cache or eviction heuristic exists before #7; no state needs resetting. */
+/* TCIM_STUB: OPTIONAL_FALLBACK: Step 2 owns expert-cache routing state; there is nothing to reset yet. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void)
 {
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Routed-expert cache seeding belongs to Step 2. */
 int ds4_gpu_stream_expert_cache_seed_experts(const ds4_gpu_stream_expert_table * arg0, const int32_t * arg1, const uint32_t * arg2, uint32_t arg3)
 {
     (void)arg0;
@@ -3544,7 +3816,7 @@ int ds4_gpu_stream_expert_cache_seed_experts(const ds4_gpu_stream_expert_table *
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Selected routed-expert cache seeding belongs to Step 2. */
 int ds4_gpu_stream_expert_cache_seed_selected(const ds4_gpu_stream_expert_table * arg0, const int32_t * arg1, uint32_t arg2)
 {
     (void)arg0;
@@ -3674,7 +3946,7 @@ int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor * arg0, int arg1)
     return 0;
 }
 
-/* TCIM_STUB: PRODUCT_REQUIRED_TODO: Model/static-span storage, residency or transfer policy belongs to #7; fail closed until implemented. */
+/* TCIM_STUB: OUT_OF_SCOPE_UNAVAILABLE: Multi-tier VRAM accounting is outside the single-device TCIM static-span path. */
 uint64_t ds4_gpu_tier_free_vram(int arg0)
 {
     (void)arg0;
