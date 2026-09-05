@@ -56,6 +56,10 @@ testing the API surface.
   other sessions of this project; do not request transfer permission again.
 - Use `ssh hq50` to access the target host. Run `hm_smi -a` there to inspect
   the available XH2 devices.
+- `make test-tcim` runs CLI/link checks followed by real-device runtime,
+  tensor and synthetic static-span smoke on logical device 0; no GGUF is
+  required. Serialize it with other device tests, for example with
+  `flock -n /tmp/ds4-xh2.lock make -j2 test-tcim` on hq50.
 - Before remote builds or tests, refresh `tcim/*.hex` locally with HDPL
   (hq50 only has the HAL SDK). Sync the worktree first, then the ignored hex
   files separately:

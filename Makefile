@@ -172,7 +172,7 @@ help:
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
 	@echo "  make tcim                Build TCIM-only ./ds4 with the XH2 HAL"
-	@echo "  make test-tcim           Build TCIM and test DS4 CLI/link integration"
+	@echo "  make test-tcim           Build TCIM and test CLI/link, runtime, tensors and static spans (device 0)"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -236,6 +236,11 @@ test-tcim: tcim
 	DS4_TCIM_OBJECTS="$(TCIM_OBJS)" \
 	DS4_TCIM_LINK_ARGS="$(TCIM_CFLAGS) $(TCIM_OBJS) $(LDLIBS) $(TCIM_HAL_LDLIBS)" \
 	./tests/test_tcim.sh
+	$(CC) $(TCIM_CFLAGS) -Werror -pedantic -o tests/test_tcim_runtime \
+		tests/test_tcim_runtime.c ds4_tcim.o tcim/xh2rt.o $(TCIM_SRCS:.hdpl=.host.o) \
+		$(LDLIBS) $(TCIM_HAL_LDLIBS) \
+		-Wl,--wrap=xh2rt_buffer_write -Wl,--wrap=xh2rt_buffer_alloc -Wl,--wrap=xh2a_ipu_open
+	./tests/test_tcim_runtime
 
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
@@ -638,4 +643,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o tcim/*.o tcim/*.hex *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_tcim_runtime tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o tcim/*.o tcim/*.hex *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

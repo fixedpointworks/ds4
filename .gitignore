@@ -30,6 +30,7 @@
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
 /tests/test_sampling
+/tests/test_tcim_runtime
 /tests/test_glm53_kda
 *.o
 /tcim/*.hex
